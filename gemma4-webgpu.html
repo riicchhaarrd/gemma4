@@ -5,16 +5,28 @@
 <title>Gemma 4 — WebGPU Inference</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:#101211;color:#e8ebe6;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;padding:24px;max-width:1120px;margin:0 auto;line-height:1.45}
-h1{color:#f3f7f0;font-size:1.7rem;font-weight:750;letter-spacing:0;margin-bottom:4px}
-h2{font-size:1rem;color:#f3f7f0;margin-bottom:8px}
-.app-header{display:flex;justify-content:space-between;align-items:flex-start;gap:20px;margin-bottom:18px}
-.sub{color:#9da69d;font-size:.92rem}
+body{background:#0f1110;color:#e8ebe6;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;padding:24px;max-width:1080px;margin:0 auto;line-height:1.45}
+h1{color:#f5f7f2;font-size:1.65rem;font-weight:760;letter-spacing:0;margin-bottom:4px}
+h2{font-size:1rem;color:#f5f7f2;margin-bottom:3px}
+.app-header{display:flex;justify-content:space-between;align-items:flex-start;gap:20px;margin-bottom:16px}
+.sub{color:#a3aaa2;font-size:.92rem}
 #gpu-info{color:#57d9c4;text-align:right;max-width:520px}
-.panel{background:#181c1a;border:1px solid #303631;border-radius:8px;padding:16px;margin-bottom:14px}
-.model-top{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;margin-bottom:14px}
-.notice{background:#261f12;border:1px solid #7f6225;color:#ffd98a;border-radius:7px;padding:10px 12px;font-size:.92rem;margin-top:8px}
-.actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
+.panel{background:#171a18;border:1px solid #2d332f;border-radius:8px;padding:16px;margin-bottom:14px}
+.model-head{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;margin-bottom:14px}
+.model-grid{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(280px,.65fr);gap:14px;align-items:start}
+.model-summary{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:12px 0}
+.metric{background:#101311;border:1px solid #29302b;border-radius:7px;padding:9px 10px;min-height:64px}
+.metric b{display:block;color:#f5f7f2;font-size:.96rem;margin-bottom:2px}
+.metric span{display:block;color:#a3aaa2;font-size:.82rem}
+.notice{background:#241d12;border:1px solid #705722;color:#ffd88b;border-radius:7px;padding:10px 12px;font-size:.9rem}
+.source-actions{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px}
+.side-panel{background:#111412;border:1px solid #29302b;border-radius:7px;padding:12px}
+.side-panel h3{font-size:.86rem;color:#cfd6cd;text-transform:uppercase;letter-spacing:.04em;margin-bottom:9px}
+.mode-row{display:flex;align-items:flex-start;gap:9px;color:#c9d0c7;font-size:.92rem;margin-bottom:9px}
+.mode-row:last-child{margin-bottom:0}
+.mode-row input{margin-top:3px;accent-color:#52d2bd}
+.mode-row small{display:block;color:#8f978e;margin-top:2px;line-height:1.35}
+.cache-line{display:flex;align-items:center;justify-content:space-between;gap:12px;color:#a3aaa2;font-size:.88rem;margin-top:12px}
 button,.file-label{appearance:none;border:1px solid #3b443f;border-radius:7px;background:#202621;color:#e8ebe6;padding:9px 14px;font:inherit;font-weight:650;cursor:pointer;min-height:40px}
 button.primary{background:#52d2bd;border-color:#52d2bd;color:#07110f}
 button.secondary{background:#202621}
@@ -23,9 +35,6 @@ button:disabled,.file-label.disabled{opacity:.45;cursor:default}
 button:hover:not(:disabled),.file-label:hover{border-color:#6fdac9}
 .file-label{display:inline-flex;align-items:center;gap:8px;position:relative;overflow:hidden}
 .file-label input{position:absolute;inset:0;opacity:0;cursor:pointer}
-.load-option{display:flex;align-items:center;gap:8px;color:#c4cbc3;font-size:.92rem}
-.load-option input{accent-color:#52d2bd}
-.cache-line{display:flex;align-items:center;justify-content:space-between;gap:12px;color:#9da69d;font-size:.88rem;margin-bottom:10px}
 #status{background:#111412;border:1px solid #303631;padding:11px 13px;border-radius:7px;margin-bottom:10px;min-height:44px;white-space:pre-wrap;font-size:.92rem}
 #status .err{color:#ff6b6b}
 #status .ok{color:#7fdbca}
@@ -44,9 +53,10 @@ button:hover:not(:disabled),.file-label:hover{border-color:#6fdac9}
 .stats{color:#666;margin-top:8px;font-size:.85em}
 @media (max-width:720px){
     body{padding:14px}
-    .app-header,.model-top,.cache-line{display:block}
+    .app-header,.model-head,.cache-line{display:block}
+    .model-grid,.model-summary,.source-actions{grid-template-columns:1fr}
     #gpu-info{text-align:left;margin-top:10px}
-    .actions button,.file-label{width:100%;justify-content:center}
+    .source-actions button,.file-label{width:100%;justify-content:center}
 }
 </style>
 </head>
@@ -59,19 +69,33 @@ button:hover:not(:disabled),.file-label:hover{border-color:#6fdac9}
 <div class="sub" id="gpu-info"></div>
 </header>
 <section class="panel" id="model-panel">
-<div class="model-top">
+<div class="model-head">
 <div>
 <h2>Model</h2>
-<div class="notice">The default GGUF is about 3 GB. The first cached load downloads the full file and can take several minutes; refreshes reuse the browser cache when storage allows it.</div>
+<div class="sub">Choose how to provide the GGUF. Nothing downloads until you start it.</div>
 </div>
 <button id="clear-cache-btn" class="danger" type="button" disabled>Clear Cache</button>
 </div>
-<div class="actions">
+<div class="model-grid">
+<div>
+<div class="model-summary">
+<div class="metric"><b>Default GGUF</b><span>gemma-4-E2B-it-UD-Q4_K_XL</span></div>
+<div class="metric"><b>About 3 GB</b><span>First cached load downloads the full file</span></div>
+<div class="metric"><b>WebGPU</b><span>Weights upload after download or file selection</span></div>
+</div>
+<div class="notice">First cached load can take several minutes. Refreshes reuse the browser cache when storage allows it.</div>
+<div class="source-actions">
 <button id="load-default-btn" class="primary" type="button">Load Default Model</button>
-<label class="load-option"><input type="checkbox" id="cache-first" checked> Download and cache first</label>
 <label class="file-label" id="file-label">Local GGUF<input type="file" id="model-file" accept=".gguf"></label>
 </div>
-<div class="cache-line"><span id="cache-info">Checking browser cache...</span><span>Use <code>?autoload=0</code> to disable automatic loading.</span></div>
+</div>
+<div class="side-panel">
+<h3>Default Load Mode</h3>
+<label class="mode-row"><input type="radio" name="load-mode" value="cache" checked><span>Download and cache first<small>Best for refreshes; stores the full GGUF in browser storage.</small></span></label>
+<label class="mode-row"><input type="radio" name="load-mode" value="stream"><span>Stream ranges<small>Starts sooner, but refreshes may fetch chunks again.</small></span></label>
+<div class="cache-line"><span id="cache-info">Checking browser cache...</span></div>
+</div>
+</div>
 <div id="status">Preparing model loader. Requires WebGPU.</div>
 <div class="bar-wrap" id="bar-wrap"><div class="bar-fill" id="bar-fill"></div></div>
 </section>
@@ -2987,8 +3011,7 @@ const DEFAULT_MODEL = {
 };
 const MODEL_CACHE_FILE = DEFAULT_MODEL.name;
 const MODEL_CACHE_META_KEY = 'gemma4.webgpu.defaultModelCache.v1';
-const AUTOSTART_DELAY_MS = 2500;
-const AUTO_LOAD_DEFAULT_MODEL = new URLSearchParams(location.search).get('autoload') !== '0';
+const AUTO_LOAD_DEFAULT_MODEL = new URLSearchParams(location.search).get('autoload') === '1';
 
 class RemoteGGUFSource {
     constructor(url, name) {
@@ -3075,13 +3098,17 @@ function setLoadingUI(isLoading) {
     const loadBtn = document.getElementById('load-default-btn');
     const fileInput = document.getElementById('model-file');
     const fileLabel = document.getElementById('file-label');
-    const cacheFirst = document.getElementById('cache-first');
+    const loadModes = document.querySelectorAll('input[name="load-mode"]');
     const clearBtn = document.getElementById('clear-cache-btn');
     loadBtn.disabled = isLoading;
     fileInput.disabled = isLoading;
-    cacheFirst.disabled = isLoading;
+    for (const mode of loadModes) mode.disabled = isLoading;
     fileLabel.classList.toggle('disabled', isLoading);
     clearBtn.disabled = isLoading || clearBtn.dataset.hasCache !== '1';
+}
+
+function shouldCacheBeforeLoad() {
+    return (document.querySelector('input[name="load-mode"]:checked')?.value || 'cache') === 'cache';
 }
 
 async function getCacheRoot() {
@@ -3261,7 +3288,7 @@ document.getElementById('model-file').addEventListener('change', async (e) => {
 async function loadDefaultModel() {
     if (loading) return;
     try {
-        const cacheFirst = document.getElementById('cache-first').checked;
+        const cacheFirst = shouldCacheBeforeLoad();
         const cached = await getCachedDefaultModel();
         if (cached) {
             status(`Loading cached ${DEFAULT_MODEL.name}${formatBytes(cached.size)}...`);
@@ -3307,7 +3334,7 @@ document.getElementById('clear-cache-btn').addEventListener('click', async () =>
 async function autoLoadDefaultModel() {
     await refreshCacheInfo();
     if (!AUTO_LOAD_DEFAULT_MODEL) {
-        status('Ready. Load the default GGUF, stream it, or choose a local file.');
+        status('Ready. Choose a load mode, then load the default GGUF or select a local file.');
         return;
     }
     await loadDefaultModel();
@@ -3315,12 +3342,12 @@ async function autoLoadDefaultModel() {
 
 refreshCacheInfo().then(() => {
     if (AUTO_LOAD_DEFAULT_MODEL) {
-        status('Default model will auto-load in a few seconds. The first cached load downloads about 3 GB.');
+        status('Autoload requested in the URL. Starting the default model load...');
+        autoLoadDefaultModel();
     } else {
-        status('Ready. Load the default GGUF, stream it, or choose a local file.');
+        status('Ready. Choose a load mode, then load the default GGUF or select a local file.');
     }
 });
-setTimeout(autoLoadDefaultModel, AUTOSTART_DELAY_MS);
 
 /* Reset KV caches by zeroing on GPU. */
 function resetKVCaches() {
