@@ -1,0 +1,3129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Gemma 4 — WebGPU Inference</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#1a1a2e;color:#e0e0e0;font-family:'Courier New',monospace;padding:20px;max-width:900px;margin:0 auto}
+h1{color:#7fdbca;margin-bottom:8px;font-size:1.4em}
+.sub{color:#888;font-size:.85em;margin-bottom:16px}
+#status{background:#16213e;border:1px solid #333;padding:10px 14px;border-radius:6px;margin-bottom:12px;min-height:40px;white-space:pre-wrap;font-size:.9em}
+#status .err{color:#ff6b6b}
+#status .ok{color:#7fdbca}
+#status .warn{color:#ffd93d}
+.bar-wrap{background:#0f3460;border-radius:4px;height:6px;margin-top:6px;display:none}
+.bar-fill{background:#7fdbca;height:100%;border-radius:4px;width:0%;transition:width .15s}
+input[type=file]{margin:10px 0;font-family:inherit;color:#e0e0e0}
+#controls{display:none;margin:12px 0}
+#prompt{width:100%;background:#16213e;color:#e0e0e0;border:1px solid #444;border-radius:6px;padding:10px;font-family:inherit;font-size:.95em;resize:vertical}
+.opts{display:flex;gap:12px;align-items:center;margin-top:8px;flex-wrap:wrap}
+.opts label{font-size:.85em;color:#aaa}
+.opts input[type=number]{width:60px;background:#16213e;color:#e0e0e0;border:1px solid #444;border-radius:4px;padding:2px 6px;font-family:inherit}
+.opts input[type=checkbox]{accent-color:#7fdbca}
+#gen-btn{background:#7fdbca;color:#1a1a2e;border:none;border-radius:6px;padding:8px 20px;font-family:inherit;font-weight:bold;cursor:pointer;font-size:.95em}
+#gen-btn:disabled{opacity:.4;cursor:default}
+#gen-btn:hover:not(:disabled){background:#a8f0dc}
+#output{background:#0d1b2a;border:1px solid #333;border-radius:6px;padding:14px;margin-top:12px;min-height:60px;white-space:pre-wrap;word-wrap:break-word;font-size:.95em;line-height:1.5;max-height:70vh;overflow-y:auto}
+.think{color:#888;font-style:italic}
+.stats{color:#666;margin-top:8px;font-size:.85em}
+</style>
+</head>
+<body>
+<h1>Gemma 4 — WebGPU Inference (Tier C)</h1>
+<div class="sub">All weights GPU-resident · Activations never leave GPU · WGSL compute shaders</div>
+<div class="sub" id="gpu-info" style="color:#7fdbca"></div>
+<div id="status">Select a GGUF model file to begin. Requires WebGPU.</div>
+<div class="bar-wrap" id="bar-wrap"><div class="bar-fill" id="bar-fill"></div></div>
+<input type="file" id="model-file" accept=".gguf">
+<div id="controls">
+<textarea id="prompt" rows="3" placeholder="Enter your prompt..."></textarea>
+<div class="opts">
+<button id="gen-btn">Generate</button>
+<label>Temp <input type="number" id="temp" value="0.7" step="0.1" min="0" max="2"></label>
+<label>Tokens <input type="number" id="max-tok" value="128" min="1" max="4096"></label>
+<label>Top-K <input type="number" id="top-k" value="40" min="0" max="1000"></label>
+<label><input type="checkbox" id="think-mode" checked> Think</label>
+<label><input type="checkbox" id="raw-mode"> Raw</label>
+</div>
+</div>
+<div id="output" style="display:none"></div>
+
+<script>
+"use strict";
+
+/* ================================================================
+   SECTION 1: FP16 / BF16 conversion
+   ================================================================ */
+
+function fp16ToF32(h) {
+    const sign = (h >>> 15) & 1;
+    const exp = (h >>> 10) & 0x1f;
+    const mant = h & 0x3ff;
+    let r;
+    if (exp === 0) {
+        r = mant === 0 ? 0 : mant / 1024 * Math.pow(2, -14);
+    } else if (exp === 31) {
+        r = mant === 0 ? Infinity : NaN;
+    } else {
+        r = (1 + mant / 1024) * Math.pow(2, exp - 15);
+    }
+    return sign ? -r : r;
+}
+
+const _bf16Buf = new ArrayBuffer(4);
+const _bf16U32 = new Uint32Array(_bf16Buf);
+const _bf16F32 = new Float32Array(_bf16Buf);
+function bf16ToF32(h) {
+    _bf16U32[0] = h << 16;
+    return _bf16F32[0];
+}
+
+/* f32 → ieee754 half (u16) for packing activations before writeBuffer. Subnormal
+   handling included; values outside ±65504 clamp to ±inf. */
+function f32ToF16(v) {
+    _bf16F32[0] = v;
+    const u = _bf16U32[0];
+    const sign = (u >>> 16) & 0x8000;
+    let exp = ((u >>> 23) & 0xff) - 127 + 15;
+    let mant = (u >>> 13) & 0x3ff;
+    if (exp <= 0) {
+        if (exp < -10) return sign;
+        /* Subnormal */
+        mant = (u >>> 13) | 0x400;
+        return sign | (mant >>> (1 - exp));
+    }
+    if (exp >= 0x1f) return sign | 0x7c00; /* clamp ±inf (NaN collapses to inf; activations shouldn't NaN) */
+    return sign | (exp << 10) | mant;
+}
+
+/* In-place f32 array → Uint16Array (half). Scratch must be pre-allocated and same length. */
+function packF16Array(srcF32, dstU16, n, scale) {
+    const s = scale !== undefined ? scale : 1.0;
+    for (let i = 0; i < n; i++) dstU16[i] = f32ToF16(srcF32[i] * s);
+}
+
+/* ================================================================
+   SECTION 2: Binary reader for GGUF parsing
+   ================================================================ */
+
+class BinaryReader {
+    constructor(buf, off = 0) {
+        this.buf = buf;
+        this.view = new DataView(buf);
+        this.pos = off;
+    }
+    u8()  { const v = this.view.getUint8(this.pos); this.pos += 1; return v; }
+    i8()  { const v = this.view.getInt8(this.pos); this.pos += 1; return v; }
+    u16() { const v = this.view.getUint16(this.pos, true); this.pos += 2; return v; }
+    i16() { const v = this.view.getInt16(this.pos, true); this.pos += 2; return v; }
+    u32() { const v = this.view.getUint32(this.pos, true); this.pos += 4; return v; }
+    i32() { const v = this.view.getInt32(this.pos, true); this.pos += 4; return v; }
+    f32() { const v = this.view.getFloat32(this.pos, true); this.pos += 4; return v; }
+    f64() { const v = this.view.getFloat64(this.pos, true); this.pos += 8; return v; }
+    u64() {
+        const lo = this.view.getUint32(this.pos, true);
+        const hi = this.view.getUint32(this.pos + 4, true);
+        this.pos += 8;
+        return lo + hi * 0x100000000;
+    }
+    i64() {
+        const lo = this.view.getUint32(this.pos, true);
+        const hi = this.view.getInt32(this.pos + 4, true);
+        this.pos += 8;
+        return lo + hi * 0x100000000;
+    }
+    str() {
+        const len = this.u64();
+        const bytes = new Uint8Array(this.buf, this.pos, len);
+        this.pos += len;
+        return new TextDecoder().decode(bytes);
+    }
+}
+
+/* ================================================================
+   SECTION 3: GGUF parser
+   ================================================================ */
+
+const GGUF_MAGIC = 0x46554747;
+const QK_K = 256;
+
+const GGML = { F32:0, F16:1, Q4_K:12, Q5_K:13, Q6_K:14, IQ4_XS:23, BF16:30 };
+
+const BLOCK_SIZE = {
+    [GGML.F32]: 4, [GGML.F16]: 2, [GGML.BF16]: 2,
+    [GGML.Q4_K]: 144, [GGML.Q5_K]: 176, [GGML.Q6_K]: 210, [GGML.IQ4_XS]: 136
+};
+const ELEMS_PER_BLOCK = {
+    [GGML.F32]: 1, [GGML.F16]: 1, [GGML.BF16]: 1,
+    [GGML.Q4_K]: QK_K, [GGML.Q5_K]: QK_K, [GGML.Q6_K]: QK_K, [GGML.IQ4_XS]: QK_K
+};
+
+function rowBytes(n, type) {
+    const epb = ELEMS_PER_BLOCK[type] || 1;
+    return (n / epb) * (BLOCK_SIZE[type] || 0);
+}
+
+function readGGUFValue(r, type) {
+    switch (type) {
+        case 0: return r.u8();
+        case 1: return r.i8();
+        case 2: return r.u16();
+        case 3: return r.i16();
+        case 4: return r.u32();
+        case 5: return r.i32();
+        case 6: return r.f32();
+        case 7: return r.u8() !== 0;
+        case 8: return r.str();
+        case 9: {
+            const et = r.u32();
+            const cnt = r.u64();
+            const a = [];
+            for (let i = 0; i < cnt; i++) a.push(readGGUFValue(r, et));
+            return a;
+        }
+        case 10: return r.u64();
+        case 11: return r.i64();
+        case 12: return r.f64();
+        default: throw new Error('Unknown GGUF type ' + type);
+    }
+}
+
+function parseGGUF(buf) {
+    const r = new BinaryReader(buf);
+    const magic = r.u32();
+    if (magic !== GGUF_MAGIC) throw new Error('Not a GGUF file');
+    const version = r.u32();
+    const nTensors = r.u64();
+    const nKV = r.u64();
+
+    const meta = {};
+    for (let i = 0; i < nKV; i++) {
+        const key = r.str();
+        const vtype = r.u32();
+        meta[key] = readGGUFValue(r, vtype);
+    }
+
+    const tensors = {};
+    for (let i = 0; i < nTensors; i++) {
+        const name = r.str();
+        const nDims = r.u32();
+        const dims = [];
+        for (let d = 0; d < nDims; d++) dims.push(r.u64());
+        const type = r.u32();
+        const offset = r.u64();
+        tensors[name] = { name, nDims, dims, type, offset };
+    }
+
+    const dataStart = (r.pos + 31) & ~31;
+    return { meta, tensors, dataStart, buf, version };
+}
+
+/* ================================================================
+   SECTION 4: CPU dequantization (norm weights & embedding rows only)
+   ================================================================ */
+
+function getScaleMinK4(j, scales) {
+    if (j < 4) return [scales[j] & 63, scales[j + 4] & 63];
+    return [
+        (scales[j + 4] & 0xf) | ((scales[j - 4] >>> 6) << 4),
+        (scales[j + 4] >>> 4) | ((scales[j] >>> 6) << 4)
+    ];
+}
+
+function dequantRowQ4K(src, srcOff, dst, n) {
+    const nb = n / QK_K;
+    const dv = new DataView(src.buffer, src.byteOffset + srcOff);
+    let dp = 0, sp = 0;
+    for (let i = 0; i < nb; i++) {
+        const d = fp16ToF32(dv.getUint16(sp, true));
+        const dmin = fp16ToF32(dv.getUint16(sp + 2, true));
+        const scales = new Uint8Array(src.buffer, src.byteOffset + srcOff + sp + 4, 12);
+        const qs = new Uint8Array(src.buffer, src.byteOffset + srcOff + sp + 16, 128);
+        let is = 0, qp = 0;
+        for (let j = 0; j < QK_K; j += 64) {
+            const [sc1, m1] = getScaleMinK4(is, scales);
+            const [sc2, m2] = getScaleMinK4(is + 1, scales);
+            const d1 = d * sc1, dm1 = dmin * m1;
+            const d2 = d * sc2, dm2 = dmin * m2;
+            for (let l = 0; l < 32; l++) dst[dp++] = d1 * (qs[qp + l] & 0xf) - dm1;
+            for (let l = 0; l < 32; l++) dst[dp++] = d2 * (qs[qp + l] >>> 4) - dm2;
+            qp += 32; is += 2;
+        }
+        sp += 144;
+    }
+}
+
+function dequantRowQ5K(src, srcOff, dst, n) {
+    const nb = n / QK_K;
+    const dv = new DataView(src.buffer, src.byteOffset + srcOff);
+    let dp = 0, sp = 0;
+    for (let i = 0; i < nb; i++) {
+        const d = fp16ToF32(dv.getUint16(sp, true));
+        const dmin = fp16ToF32(dv.getUint16(sp + 2, true));
+        const scales = new Uint8Array(src.buffer, src.byteOffset + srcOff + sp + 4, 12);
+        const qh = new Uint8Array(src.buffer, src.byteOffset + srcOff + sp + 16, 32);
+        const ql = new Uint8Array(src.buffer, src.byteOffset + srcOff + sp + 48, 128);
+        let is = 0, qlp = 0, u1 = 1, u2 = 2;
+        for (let j = 0; j < QK_K; j += 64) {
+            const [sc1, m1] = getScaleMinK4(is, scales);
+            const [sc2, m2] = getScaleMinK4(is + 1, scales);
+            const d1 = d * sc1, dm1 = dmin * m1;
+            const d2 = d * sc2, dm2 = dmin * m2;
+            for (let l = 0; l < 32; l++) dst[dp++] = d1 * ((ql[qlp+l] & 0xf) + (qh[l] & u1 ? 16 : 0)) - dm1;
+            for (let l = 0; l < 32; l++) dst[dp++] = d2 * ((ql[qlp+l] >>> 4) + (qh[l] & u2 ? 16 : 0)) - dm2;
+            qlp += 32; is += 2; u1 <<= 2; u2 <<= 2;
+        }
+        sp += 176;
+    }
+}
+
+function dequantRowQ6K(src, srcOff, dst, n) {
+    const nb = n / QK_K;
+    let dp = 0, sp = 0;
+    for (let i = 0; i < nb; i++) {
+        const base = src.byteOffset + srcOff + sp;
+        const ql = new Uint8Array(src.buffer, base, 128);
+        const qh = new Uint8Array(src.buffer, base + 128, 64);
+        const sc = new Int8Array(src.buffer, base + 192, 16);
+        const d = fp16ToF32(new DataView(src.buffer).getUint16(base + 208, true));
+        let qlp = 0, qhp = 0, scp = 0;
+        for (let n2 = 0; n2 < QK_K; n2 += 128) {
+            for (let l = 0; l < 32; l++) {
+                const is = (l >>> 4);
+                const q1 = ((ql[qlp + l] & 0xf) | (((qh[qhp + l] >>> 0) & 3) << 4)) - 32;
+                const q2 = ((ql[qlp + l + 32] & 0xf) | (((qh[qhp + l] >>> 2) & 3) << 4)) - 32;
+                const q3 = ((ql[qlp + l] >>> 4) | (((qh[qhp + l] >>> 4) & 3) << 4)) - 32;
+                const q4 = ((ql[qlp + l + 32] >>> 4) | (((qh[qhp + l] >>> 6) & 3) << 4)) - 32;
+                dst[dp + l]      = d * sc[scp + is] * q1;
+                dst[dp + l + 32] = d * sc[scp + is + 2] * q2;
+                dst[dp + l + 64] = d * sc[scp + is + 4] * q3;
+                dst[dp + l + 96] = d * sc[scp + is + 6] * q4;
+            }
+            dp += 128; qlp += 64; qhp += 32; scp += 8;
+        }
+        sp += 210;
+    }
+}
+
+const IQ4NL = [-127,-104,-83,-65,-49,-35,-22,-10,1,13,25,38,53,69,89,113];
+
+function dequantRowIQ4XS(src, srcOff, dst, n) {
+    const nb = n / QK_K;
+    let dp = 0, sp = 0;
+    for (let i = 0; i < nb; i++) {
+        const base = src.byteOffset + srcOff + sp;
+        const dv = new DataView(src.buffer, base);
+        const d = fp16ToF32(dv.getUint16(0, true));
+        const scales_h = dv.getUint16(2, true);
+        const scales_l = new Uint8Array(src.buffer, base + 4, 4);
+        const qs = new Uint8Array(src.buffer, base + 8, 128);
+        let qp = 0;
+        for (let ib = 0; ib < 8; ib++) {
+            const ls = ((scales_l[ib >>> 1] >>> (4 * (ib & 1))) & 0xf) |
+                       (((scales_h >>> (2 * ib)) & 3) << 4);
+            const dl = d * (ls - 32);
+            for (let j = 0; j < 16; j++) {
+                dst[dp + j]      = dl * IQ4NL[qs[qp + j] & 0xf];
+                dst[dp + j + 16] = dl * IQ4NL[qs[qp + j] >>> 4];
+            }
+            dp += 32; qp += 16;
+        }
+        sp += 136;
+    }
+}
+
+function dequantRow(src, srcOff, dst, n, type) {
+    const base = src.byteOffset + srcOff;
+    switch (type) {
+        case GGML.F32: {
+            const f = new Float32Array(src.buffer, base, n);
+            dst.set(f);
+            break;
+        }
+        case GGML.F16: {
+            const u = new Uint16Array(src.buffer, base, n);
+            for (let i = 0; i < n; i++) dst[i] = fp16ToF32(u[i]);
+            break;
+        }
+        case GGML.BF16: {
+            const u = new Uint16Array(src.buffer, base, n);
+            for (let i = 0; i < n; i++) dst[i] = bf16ToF32(u[i]);
+            break;
+        }
+        case GGML.Q4_K:  dequantRowQ4K(src, srcOff, dst, n); break;
+        case GGML.Q5_K:  dequantRowQ5K(src, srcOff, dst, n); break;
+        case GGML.Q6_K:  dequantRowQ6K(src, srcOff, dst, n); break;
+        case GGML.IQ4_XS: dequantRowIQ4XS(src, srcOff, dst, n); break;
+        default: throw new Error('Unsupported quant type for CPU dequant: ' + type);
+    }
+}
+
+/* ================================================================
+   SECTION 5: BPE Tokenizer
+   ================================================================ */
+
+class Tokenizer {
+    constructor(meta) {
+        const tokens = meta['tokenizer.ggml.tokens'];
+        const scores = meta['tokenizer.ggml.scores'];
+        const types  = meta['tokenizer.ggml.token_type'];
+        this.nVocab = tokens.length;
+        this.tokens = tokens;
+        this.scores = scores;
+        this.types = types;
+        this.bosId = meta['tokenizer.ggml.bos_token_id'];
+        this.eosId = meta['tokenizer.ggml.eos_token_id'];
+
+        this.tokenMap = new Map();
+        for (let i = 0; i < this.nVocab; i++) {
+            if (tokens[i]) this.tokenMap.set(tokens[i], i);
+        }
+
+        this.byteTokens = new Int32Array(256).fill(-1);
+        for (let b = 0; b < 256; b++) {
+            const s = '<0x' + b.toString(16).toUpperCase().padStart(2, '0') + '>';
+            const id = this.tokenMap.get(s);
+            if (id !== undefined) this.byteTokens[b] = id;
+        }
+    }
+
+    lookup(s) {
+        const id = this.tokenMap.get(s);
+        return id !== undefined ? id : -1;
+    }
+
+    encode(text) {
+        let buf = '';
+        for (let i = 0; i < text.length; i++) {
+            buf += text[i] === ' ' ? '▁' : text[i];
+        }
+        const toks = [];
+        let p = 0;
+        while (p < buf.length) {
+            const cp = buf.codePointAt(p);
+            const clen = cp > 0xffff ? 2 : 1;
+            const ch = buf.substring(p, p + clen);
+            const id = this.lookup(ch);
+            if (id >= 0) {
+                toks.push({ str: ch, id });
+            } else {
+                const enc = new TextEncoder().encode(ch);
+                for (const byte of enc) {
+                    const s = '<0x' + byte.toString(16).toUpperCase().padStart(2, '0') + '>';
+                    toks.push({ str: s, id: this.byteTokens[byte] });
+                }
+            }
+            p += clen;
+        }
+        for (;;) {
+            let bestScore = -Infinity, bestIdx = -1, bestId = -1;
+            for (let i = 0; i < toks.length - 1; i++) {
+                const merged = toks[i].str + toks[i + 1].str;
+                const id = this.lookup(merged);
+                if (id >= 0 && this.scores[id] > bestScore) {
+                    bestScore = this.scores[id];
+                    bestIdx = i;
+                    bestId = id;
+                }
+            }
+            if (bestIdx < 0) break;
+            toks[bestIdx] = { str: toks[bestIdx].str + toks[bestIdx + 1].str, id: bestId };
+            toks.splice(bestIdx + 1, 1);
+        }
+        return toks.map(t => t.id);
+    }
+
+    encodeChat(text, think) {
+        const TOK_THINK = 98, TOK_CHANNEL = 100, TOK_CHANNEL_END = 101;
+        const TOK_START = 105, TOK_END = 106, TOK_NL = 107;
+        const out = [this.bosId];
+        if (think) {
+            out.push(TOK_START, ...this.encode('system'), TOK_NL, TOK_THINK, TOK_NL, TOK_END, TOK_NL);
+        }
+        out.push(TOK_START, ...this.encode('user'), TOK_NL, ...this.encode(text), TOK_END, TOK_NL);
+        out.push(TOK_START, ...this.encode('model'), TOK_NL);
+        if (!think) {
+            out.push(TOK_CHANNEL, ...this.encode('thought'), TOK_NL, TOK_CHANNEL_END);
+        }
+        return out;
+    }
+
+    encodeRaw(text) {
+        return [this.bosId, ...this.encode(text)];
+    }
+
+    decode(id) {
+        if (id < 0 || id >= this.nVocab) return '';
+        return this.tokens[id] || '';
+    }
+
+    detokenize(id) {
+        let s = this.decode(id);
+        if (!s) return '';
+        if (s.length === 6 && s[0] === '<' && s[1] === '0' && s[2] === 'x' && s[5] === '>') {
+            return String.fromCharCode(parseInt(s.substring(3, 5), 16));
+        }
+        return s.replace(/▁/g, ' ');
+    }
+}
+
+/* ================================================================
+   SECTION 6: WGSL compute shaders
+   All kernels operate on storage buffers. Weights are raw byte arrays
+   viewed as array<u32>; shaders decode bytes via bit shifts. Activations
+   are f32. All matmul kernels use workgroup reduction across the K axis.
+   ================================================================ */
+
+/* Common WGSL snippets shared by quantized matmul kernels */
+const WGSL_COMMON_DECODE = `
+fn rb(off: u32) -> u32 {
+    let word = W[off >> 2u];
+    return (word >> ((off & 3u) * 8u)) & 0xFFu;
+}
+fn rb16(off: u32) -> u32 {
+    return rb(off) | (rb(off + 1u) << 8u);
+}
+fn f16_to_f32(h: u32) -> f32 {
+    let s = (h >> 15u) & 1u;
+    let e = (h >> 10u) & 0x1Fu;
+    let m = h & 0x3FFu;
+    var r: f32;
+    if (e == 0u) {
+        if (m == 0u) { r = 0.0; } else { r = f32(m) / 1024.0 * exp2(-14.0); }
+    } else if (e == 31u) {
+        r = 65504.0;
+    } else {
+        r = (1.0 + f32(m) / 1024.0) * exp2(f32(i32(e) - 15));
+    }
+    if (s == 1u) { r = -r; }
+    return r;
+}
+fn bf16_to_f32(h: u32) -> f32 {
+    return bitcast<f32>(h << 16u);
+}
+`;
+
+/* When the adapter doesn't expose shader-f16, rewrite f16-coded WGSL to plain
+   f32 by: stripping `enable f16;`, swapping `array<f16>` → `array<f32>` in
+   storage/workgroup declarations, and removing the outer `f16(...)` narrowing
+   casts (inner content stays — `f32(...)` casts remain harmless). */
+function toF32Shader(wgsl) {
+    wgsl = wgsl.replace(/enable f16;\n?/g, '');
+    wgsl = wgsl.replace(/array<f16>/g, 'array<f32>');
+    wgsl = wgsl.replace(/array<f16,/g, 'array<f32,');
+    let out = '', i = 0;
+    while (i < wgsl.length) {
+        if (wgsl.substr(i, 4) === 'f16(' && (i === 0 || !/[A-Za-z0-9_]/.test(wgsl[i - 1]))) {
+            /* Scan balanced parens to find matching close. */
+            let depth = 1, j = i + 4;
+            while (j < wgsl.length) {
+                const c = wgsl[j];
+                if (c === '(') depth++;
+                else if (c === ')') {
+                    depth--;
+                    if (depth === 0) break;
+                }
+                j++;
+            }
+            out += '(' + wgsl.substring(i + 4, j) + ')';
+            i = j + 1;
+        } else {
+            out += wgsl[i++];
+        }
+    }
+    return out;
+}
+
+const WG_MM = 128;  /* matmul workgroup size (WG=256 was measurably slower on Blackwell:
+                       fewer WGs/SM, less latency hiding, more reduction barriers) */
+const M_ROWS = 4;   /* output rows per workgroup */
+const TILE   = 256; /* K-axis tile loaded into shared memory per step */
+/* Each thread holds M_ROWS private partial sums, loads 2 X elements per tile,
+   decodes 2 element-steps per row. Shared memory: X_tile (1KB) + red (2KB). */
+
+/* Prologue shared by every tiled matmul kernel. Declares bindings, common
+   decode helpers, and the X_tile/red shared-memory buffers. */
+const WGSL_TILED_PROLOGUE = `
+enable f16;
+struct Params { n_in: u32, n_out: u32, row_bytes: u32, row_base: u32, softcap_bits: u32, _pad: u32 };
+@group(0) @binding(0) var<storage, read>       W: array<u32>;
+@group(0) @binding(1) var<storage, read>       X: array<f16>;
+@group(0) @binding(2) var<storage, read_write> Y: array<f16>;
+@group(0) @binding(3) var<uniform>             P: Params;
+
+fn rb(off: u32) -> u32 {
+    let word = W[off >> 2u];
+    return (word >> ((off & 3u) * 8u)) & 0xFFu;
+}
+fn rb16(off: u32) -> u32 { return rb(off) | (rb(off + 1u) << 8u); }
+/* Decode weight-side packed IEEE754 half (u16 stored in u32) → f32. Named
+   hpk_to_f32 so it doesn't collide with the native f16 type constructor. */
+fn hpk_to_f32(h: u32) -> f32 {
+    let s = (h >> 15u) & 1u;
+    let e = (h >> 10u) & 0x1Fu;
+    let m = h & 0x3FFu;
+    var r: f32;
+    if (e == 0u) { if (m == 0u) { r = 0.0; } else { r = f32(m) / 1024.0 * exp2(-14.0); } }
+    else if (e == 31u) { r = 65504.0; }
+    else { r = (1.0 + f32(m) / 1024.0) * exp2(f32(i32(e) - 15)); }
+    if (s == 1u) { r = -r; }
+    return r;
+}
+fn bpk_to_f32(h: u32) -> f32 { return bitcast<f32>(h << 16u); }
+
+/* Shared X tile is f16 — half the shared memory, and loads half as many bytes. */
+var<workgroup> X_tile: array<f16, ${TILE}u>;
+var<workgroup> red:    array<f32, ${M_ROWS * WG_MM}u>;
+`;
+
+/* Shared header for both epilogue variants: compute per-thread partial sums
+   over nT tiles, reusing X_tile across M_ROWS rows per workgroup. */
+const WGSL_TILED_MAIN_HEADER = `
+    let row_base = wid.x * ${M_ROWS}u + P.row_base;
+    let nT = P.n_in / ${TILE}u;
+
+    var ps: array<f32, ${M_ROWS}u>;
+    for (var m = 0u; m < ${M_ROWS}u; m = m + 1u) { ps[m] = 0.0; }
+
+    for (var t = 0u; t < nT; t = t + 1u) {
+        let xb = t * ${TILE}u;
+        /* 128 threads × 2 elements each = 256 (one X_tile). */
+        let bi = lid.x * 2u;
+        X_tile[bi + 0u] = X[xb + bi + 0u];
+        X_tile[bi + 1u] = X[xb + bi + 1u];
+        workgroupBarrier();
+
+        for (var m = 0u; m < ${M_ROWS}u; m = m + 1u) {
+            let row = row_base + m;
+            if (row < P.n_out) {
+                let rs = row * P.row_bytes;
+                ps[m] = ps[m] + dot_tile(rs, t, lid.x);
+            }
+        }
+        workgroupBarrier();
+    }
+`;
+
+/* Per-row reduction snippets used by the vectorized Q4_K/Q6_K kernels
+   (where each row maps to 32 threads). Two variants; the assembler picks one
+   by substituting at the REDUCE_ROW sentinel based on hasSubgroups. */
+const TREE_REDUCE_ROW_32 = `
+    red[lid.x] = acc;
+    workgroupBarrier();
+    var sr: u32 = 16u;
+    loop {
+        if (sr == 0u) { break; }
+        if (thread_in_row < sr) { red[lid.x] = red[lid.x] + red[lid.x + sr]; }
+        workgroupBarrier();
+        sr = sr >> 1u;
+    }
+    if (thread_in_row == 0u && has_row) {
+        let sum_v = red[lid.x];
+        let sc_s = bitcast<f32>(P.softcap_bits);
+        var out_v = sum_v;
+        if (sc_s != 0.0) { out_v = tanh(sum_v / sc_s) * sc_s; }
+        Y[row] = f16(out_v);
+    }
+`;
+/* Subgroup reduction: one subgroupAdd across the 32-thread warp yields the
+   row sum in a single instruction. Requires sg_size == 32 (NVIDIA/Apple). */
+const SG_REDUCE_ROW_32 = `
+    let row_sum = subgroupAdd(acc);
+    if (thread_in_row == 0u && has_row) {
+        let sc_s = bitcast<f32>(P.softcap_bits);
+        var out_v = row_sum;
+        if (sc_s != 0.0) { out_v = tanh(row_sum / sc_s) * sc_s; }
+        Y[row] = f16(out_v);
+    }
+`;
+
+/* FFN kernel has two partial sums (gate, up); reduce each separately so we
+   have both scalars available for the gelu(gate)*up write. */
+const TREE_REDUCE_ACC_G = `
+    red[lid.x] = acc_g;
+    workgroupBarrier();
+    var sg: u32 = 16u;
+    loop {
+        if (sg == 0u) { break; }
+        if (thread_in_row < sg) { red[lid.x] = red[lid.x] + red[lid.x + sg]; }
+        workgroupBarrier();
+        sg = sg >> 1u;
+    }
+    let gate_val = red[row_in_wg * 32u];
+    workgroupBarrier();
+`;
+const SG_REDUCE_ACC_G = `
+    let gate_val = subgroupAdd(acc_g);
+`;
+const TREE_REDUCE_ACC_U = `
+    red[lid.x] = acc_u;
+    workgroupBarrier();
+    var su: u32 = 16u;
+    loop {
+        if (su == 0u) { break; }
+        if (thread_in_row < su) { red[lid.x] = red[lid.x] + red[lid.x + su]; }
+        workgroupBarrier();
+        su = su >> 1u;
+    }
+    let up_val = red[row_in_wg * 32u];
+`;
+const SG_REDUCE_ACC_U = `
+    let up_val = subgroupAdd(acc_u);
+`;
+
+/* Tree-reduction epilogue: portable fallback when the 'subgroups' feature
+   is not available. 7 barrier-synchronised shared-memory steps for WG=128. */
+const WGSL_TILED_EPILOGUE_TREE = `
+@compute @workgroup_size(${WG_MM}, 1, 1)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+${WGSL_TILED_MAIN_HEADER}
+    for (var m = 0u; m < ${M_ROWS}u; m = m + 1u) {
+        red[m * ${WG_MM}u + lid.x] = ps[m];
+    }
+    workgroupBarrier();
+    var stride: u32 = ${WG_MM}u >> 1u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid.x < stride) {
+            for (var m = 0u; m < ${M_ROWS}u; m = m + 1u) {
+                red[m * ${WG_MM}u + lid.x] = red[m * ${WG_MM}u + lid.x] + red[m * ${WG_MM}u + lid.x + stride];
+            }
+        }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+    if (lid.x < ${M_ROWS}u) {
+        let row = row_base + lid.x;
+        if (row < P.n_out) {
+            let sum_v = red[lid.x * ${WG_MM}u];
+            let sc_s = bitcast<f32>(P.softcap_bits);
+            var out_v = sum_v;
+            if (sc_s != 0.0) { out_v = tanh(sum_v / sc_s) * sc_s; }
+            Y[row] = f16(out_v);
+        }
+    }
+}
+`;
+
+/* Subgroup-reduction epilogue: one subgroupAdd per warp replaces the tree.
+   Then M_ROWS threads sum up at most ~8 warp-level partials.
+   Red layout: red[m * 32 + warp_id]. (32 is an upper bound on n_warps when
+   subgroup_size >= 4, which holds on all known hardware.) */
+const WGSL_TILED_EPILOGUE_SG = `
+@compute @workgroup_size(${WG_MM}, 1, 1)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(subgroup_invocation_id) sg_inv: u32,
+        @builtin(subgroup_size) sg_size: u32) {
+${WGSL_TILED_MAIN_HEADER}
+    let warp_id = lid.x / sg_size;
+    let n_warps = ${WG_MM}u / sg_size;
+    for (var m = 0u; m < ${M_ROWS}u; m = m + 1u) {
+        let sum_in_warp = subgroupAdd(ps[m]);
+        if (sg_inv == 0u) {
+            red[m * 32u + warp_id] = sum_in_warp;
+        }
+    }
+    workgroupBarrier();
+    if (lid.x < ${M_ROWS}u) {
+        let row = row_base + lid.x;
+        if (row < P.n_out) {
+            var total: f32 = 0.0;
+            for (var w = 0u; w < n_warps; w = w + 1u) {
+                total = total + red[lid.x * 32u + w];
+            }
+            let sc_s = bitcast<f32>(P.softcap_bits);
+            var out_v = total;
+            if (sc_s != 0.0) { out_v = tanh(total / sc_s) * sc_s; }
+            Y[row] = f16(out_v);
+        }
+    }
+}
+`;
+
+/* ── Per-quant dot_tile functions ────────────────────────────────────── */
+
+/* Each thread (lid_x in 0..64) accumulates its four assigned elements of
+   the 256-element tile: e ∈ {lid_x, lid_x+64, lid_x+128, lid_x+192}. */
+
+const Q4K_DOT_TILE = `
+fn dot_tile(rs: u32, t: u32, lid_x: u32) -> f32 {
+    let bs = rs + t * 144u;
+    let d  = hpk_to_f32(rb16(bs));
+    let dm = hpk_to_f32(rb16(bs + 2u));
+    var sc: array<u32, 12>;
+    for (var k = 0u; k < 12u; k = k + 1u) { sc[k] = rb(bs + 4u + k); }
+    var acc: f32 = 0.0;
+    for (var s = 0u; s < 2u; s = s + 1u) {
+        let e = lid_x + s * 128u;
+        let g = e >> 6u;           // 0..3
+        let sub = (e >> 5u) & 1u;  // 0 lo-nibble half, 1 hi-nibble half
+        let l = e & 31u;
+        let qv = rb(bs + 16u + g * 32u + l);
+        var nib: u32;
+        if (sub == 0u) { nib = qv & 0xFu; } else { nib = qv >> 4u; }
+        let ig = g * 2u + sub;
+        var sd: u32; var sm: u32;
+        if (ig < 4u) {
+            sd = sc[ig] & 63u;
+            sm = sc[ig + 4u] & 63u;
+        } else {
+            sd = (sc[ig + 4u] & 0xFu) | ((sc[ig - 4u] >> 6u) << 4u);
+            sm = (sc[ig + 4u] >> 4u)  | ((sc[ig] >> 6u) << 4u);
+        }
+        acc = acc + (d * f32(sd) * f32(nib) - dm * f32(sm)) * f32(X_tile[e]);
+    }
+    return acc;
+}
+`;
+
+/* Vectorized Q4_K matmul kernel — not dot_tile-based.
+   Thread layout: 128 threads = 4 rows × 32 threads per row (matches NVIDIA
+   warp). Per tile (256 K elements) each thread reads ONE u32 of packed
+   quants (4 bytes = 8 nibbles) and computes 8 products against the cached
+   X tile: 4 low-nibble elements + 4 high-nibble elements from the same 4
+   bytes. Replaces 8 individual byte reads via rb() with a single aligned
+   u32 load — big memory-BW win on dense matmul.
+
+   Per thread t_r ∈ 0..31 within row:
+     g = t_r / 8 (0..3, Q4_K group)
+     u = t_r % 8 (0..7, u32 within group)
+     u32 byte offset = bs + 16 + g*32 + u*4  (always 4-byte aligned)
+     elements processed:
+       lo nibbles: elo+0..elo+3 where elo = g*64 + u*4
+       hi nibbles: ehi+0..ehi+3 where ehi = elo + 32
+   Per-row reduction tree-reduces 32 thread partials. */
+const WGSL_MATMUL_Q4K_VEC = `
+@compute @workgroup_size(128, 1, 1)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    let row_in_wg     = lid.x >> 5u;
+    let thread_in_row = lid.x & 31u;
+    let row = wid.x * 4u + row_in_wg + P.row_base;
+    let has_row = row < P.n_out;
+    let nT = P.n_in >> 8u;
+    let rs = row * P.row_bytes;
+
+    let g = thread_in_row >> 3u;   // 0..3
+    let u = thread_in_row & 7u;    // 0..7
+    let elo = g * 64u + u * 4u;
+    let ehi = elo + 32u;
+
+    var acc: f32 = 0.0;
+
+    for (var t = 0u; t < nT; t = t + 1u) {
+        /* Cooperative X tile load (128 × 2 = 256). */
+        let xb = t * 256u;
+        let bi = lid.x * 2u;
+        X_tile[bi + 0u] = X[xb + bi + 0u];
+        X_tile[bi + 1u] = X[xb + bi + 1u];
+        workgroupBarrier();
+
+        if (has_row) {
+            let bs = rs + t * 144u;
+            let d  = hpk_to_f32(rb16(bs));
+            let dm = hpk_to_f32(rb16(bs + 2u));
+            /* Scales: 12 bytes at bs+4 → 3 aligned u32s. */
+            let sc_idx = (bs + 4u) >> 2u;
+            let su0 = W[sc_idx + 0u];
+            let su1 = W[sc_idx + 1u];
+            let su2 = W[sc_idx + 2u];
+
+            /* Pick the two (sd, sm) scale pairs for this thread's group g
+               from the packed 12-byte scales. Layout per ggml Q4_K:
+                 ig in 0..3: sc[ig] low-6 bits + sc[ig+4] low-6 bits
+                 ig in 4..7: (sc[ig+4] low-4 | sc[ig-4] hi-2 << 4) etc. */
+            var sd_lo: u32; var sm_lo: u32;
+            var sd_hi: u32; var sm_hi: u32;
+            if (g == 0u) {
+                sd_lo =  su0         & 63u;
+                sm_lo =  su1         & 63u;
+                sd_hi = (su0 >>  8u) & 63u;
+                sm_hi = (su1 >>  8u) & 63u;
+            } else if (g == 1u) {
+                sd_lo = (su0 >> 16u) & 63u;
+                sm_lo = (su1 >> 16u) & 63u;
+                sd_hi = (su0 >> 24u) & 63u;
+                sm_hi = (su1 >> 24u) & 63u;
+            } else if (g == 2u) {
+                sd_lo = ( su2        & 0xFu) | (((su0 >>  6u) & 3u) << 4u);
+                sm_lo = ((su2 >>  4u)& 0xFu) | (((su1 >>  6u) & 3u) << 4u);
+                sd_hi = ((su2 >>  8u)& 0xFu) | (((su0 >> 14u) & 3u) << 4u);
+                sm_hi = ((su2 >> 12u)& 0xFu) | (((su1 >> 14u) & 3u) << 4u);
+            } else {
+                sd_lo = ((su2 >> 16u)& 0xFu) | (((su0 >> 22u) & 3u) << 4u);
+                sm_lo = ((su2 >> 20u)& 0xFu) | (((su1 >> 22u) & 3u) << 4u);
+                sd_hi = ((su2 >> 24u)& 0xFu) | (((su0 >> 30u) & 3u) << 4u);
+                sm_hi = ((su2 >> 28u)& 0xFu) | (((su1 >> 30u) & 3u) << 4u);
+            }
+
+            let d1 = d * f32(sd_lo); let m1 = dm * f32(sm_lo);
+            let d2 = d * f32(sd_hi); let m2 = dm * f32(sm_hi);
+
+            /* One aligned u32 of quants: 4 bytes = 4 low-nibble + 4 high-nibble pairs. */
+            let qw = W[(bs + 16u + g * 32u + u * 4u) >> 2u];
+            let b0 =  qw         & 0xFFu;
+            let b1 = (qw >>  8u) & 0xFFu;
+            let b2 = (qw >> 16u) & 0xFFu;
+            let b3 = (qw >> 24u) & 0xFFu;
+
+            acc = acc + (d1 * f32(b0 & 0xFu) - m1) * f32(X_tile[elo + 0u]);
+            acc = acc + (d1 * f32(b1 & 0xFu) - m1) * f32(X_tile[elo + 1u]);
+            acc = acc + (d1 * f32(b2 & 0xFu) - m1) * f32(X_tile[elo + 2u]);
+            acc = acc + (d1 * f32(b3 & 0xFu) - m1) * f32(X_tile[elo + 3u]);
+            acc = acc + (d2 * f32(b0 >> 4u) - m2) * f32(X_tile[ehi + 0u]);
+            acc = acc + (d2 * f32(b1 >> 4u) - m2) * f32(X_tile[ehi + 1u]);
+            acc = acc + (d2 * f32(b2 >> 4u) - m2) * f32(X_tile[ehi + 2u]);
+            acc = acc + (d2 * f32(b3 >> 4u) - m2) * f32(X_tile[ehi + 3u]);
+        }
+        workgroupBarrier();
+    }
+
+    /* Reduce within each row's 32 threads. Assembler picks tree vs subgroup. */
+    /*[REDUCE_ROW]*/
+}
+`;
+
+/* Fused FFN kernel: computes Y[row] = gelu(gate·xb) * (up·xb) in ONE dispatch,
+   replacing gate-matmul + up-matmul + gelu_mul. Both Wgate and Wup are Q4_K.
+   Same 128-thread, 4-row, 32-threads-per-row, vectorized-u32 layout as the
+   standalone Q4_K kernel — just processes both weight tensors simultaneously
+   against the shared X_tile. Saves 2 dispatches/layer plus one redundant X
+   read per layer. */
+const WGSL_MATMUL_Q4K_FFN = `
+enable f16;
+struct Params { n_in: u32, n_out: u32, row_bytes: u32, row_base: u32 };
+@group(0) @binding(0) var<storage, read>       Wg: array<u32>;
+@group(0) @binding(1) var<storage, read>       Wu: array<u32>;
+@group(0) @binding(2) var<storage, read>       X:  array<f16>;
+@group(0) @binding(3) var<storage, read_write> Y:  array<f16>;
+@group(0) @binding(4) var<uniform>             P:  Params;
+
+fn rbg(off: u32) -> u32 { let w = Wg[off >> 2u]; return (w >> ((off & 3u) * 8u)) & 0xFFu; }
+fn rbg16(off: u32) -> u32 { return rbg(off) | (rbg(off + 1u) << 8u); }
+fn rbu(off: u32) -> u32 { let w = Wu[off >> 2u]; return (w >> ((off & 3u) * 8u)) & 0xFFu; }
+fn rbu16(off: u32) -> u32 { return rbu(off) | (rbu(off + 1u) << 8u); }
+fn hpk_to_f32(h: u32) -> f32 {
+    let s = (h >> 15u) & 1u;
+    let e = (h >> 10u) & 0x1Fu;
+    let m = h & 0x3FFu;
+    var r: f32;
+    if (e == 0u) { if (m == 0u) { r = 0.0; } else { r = f32(m) / 1024.0 * exp2(-14.0); } }
+    else if (e == 31u) { r = 65504.0; }
+    else { r = (1.0 + f32(m) / 1024.0) * exp2(f32(i32(e) - 15)); }
+    if (s == 1u) { r = -r; }
+    return r;
+}
+
+var<workgroup> X_tile: array<f16, 256u>;
+var<workgroup> red:    array<f32, 128u>;
+
+@compute @workgroup_size(128, 1, 1)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    let row_in_wg     = lid.x >> 5u;
+    let thread_in_row = lid.x & 31u;
+    let row = wid.x * 4u + row_in_wg + P.row_base;
+    let has_row = row < P.n_out;
+    let nT = P.n_in >> 8u;
+    let rs = row * P.row_bytes;
+
+    let g = thread_in_row >> 3u;
+    let u = thread_in_row & 7u;
+    let elo = g * 64u + u * 4u;
+    let ehi = elo + 32u;
+
+    var acc_g: f32 = 0.0;
+    var acc_u: f32 = 0.0;
+
+    for (var t = 0u; t < nT; t = t + 1u) {
+        let xb = t * 256u;
+        let bi = lid.x * 2u;
+        X_tile[bi + 0u] = X[xb + bi + 0u];
+        X_tile[bi + 1u] = X[xb + bi + 1u];
+        workgroupBarrier();
+
+        if (has_row) {
+            let bs = rs + t * 144u;
+
+            /* ----- gate ----- */
+            let d_g  = hpk_to_f32(rbg16(bs));
+            let dm_g = hpk_to_f32(rbg16(bs + 2u));
+            let scg = (bs + 4u) >> 2u;
+            let g0 = Wg[scg + 0u]; let g1 = Wg[scg + 1u]; let g2 = Wg[scg + 2u];
+            var sdl: u32; var sml: u32; var sdh: u32; var smh: u32;
+            if (g == 0u) {
+                sdl =  g0        & 63u; sml =  g1        & 63u;
+                sdh = (g0 >>  8u) & 63u; smh = (g1 >>  8u) & 63u;
+            } else if (g == 1u) {
+                sdl = (g0 >> 16u) & 63u; sml = (g1 >> 16u) & 63u;
+                sdh = (g0 >> 24u) & 63u; smh = (g1 >> 24u) & 63u;
+            } else if (g == 2u) {
+                sdl = ( g2        & 0xFu) | (((g0 >>  6u) & 3u) << 4u);
+                sml = ((g2 >>  4u)& 0xFu) | (((g1 >>  6u) & 3u) << 4u);
+                sdh = ((g2 >>  8u)& 0xFu) | (((g0 >> 14u) & 3u) << 4u);
+                smh = ((g2 >> 12u)& 0xFu) | (((g1 >> 14u) & 3u) << 4u);
+            } else {
+                sdl = ((g2 >> 16u)& 0xFu) | (((g0 >> 22u) & 3u) << 4u);
+                sml = ((g2 >> 20u)& 0xFu) | (((g1 >> 22u) & 3u) << 4u);
+                sdh = ((g2 >> 24u)& 0xFu) | (((g0 >> 30u) & 3u) << 4u);
+                smh = ((g2 >> 28u)& 0xFu) | (((g1 >> 30u) & 3u) << 4u);
+            }
+            let d1g = d_g * f32(sdl); let m1g = dm_g * f32(sml);
+            let d2g = d_g * f32(sdh); let m2g = dm_g * f32(smh);
+            let qwg = Wg[(bs + 16u + g * 32u + u * 4u) >> 2u];
+            acc_g = acc_g + (d1g * f32( qwg         & 0xFu) - m1g) * f32(X_tile[elo + 0u]);
+            acc_g = acc_g + (d1g * f32((qwg >>  8u) & 0xFu) - m1g) * f32(X_tile[elo + 1u]);
+            acc_g = acc_g + (d1g * f32((qwg >> 16u) & 0xFu) - m1g) * f32(X_tile[elo + 2u]);
+            acc_g = acc_g + (d1g * f32((qwg >> 24u) & 0xFu) - m1g) * f32(X_tile[elo + 3u]);
+            acc_g = acc_g + (d2g * f32((qwg >>  4u) & 0xFu) - m2g) * f32(X_tile[ehi + 0u]);
+            acc_g = acc_g + (d2g * f32((qwg >> 12u) & 0xFu) - m2g) * f32(X_tile[ehi + 1u]);
+            acc_g = acc_g + (d2g * f32((qwg >> 20u) & 0xFu) - m2g) * f32(X_tile[ehi + 2u]);
+            acc_g = acc_g + (d2g * f32((qwg >> 28u) & 0xFu) - m2g) * f32(X_tile[ehi + 3u]);
+
+            /* ----- up ----- */
+            let d_u  = hpk_to_f32(rbu16(bs));
+            let dm_u = hpk_to_f32(rbu16(bs + 2u));
+            let scu = (bs + 4u) >> 2u;
+            let u0 = Wu[scu + 0u]; let u1 = Wu[scu + 1u]; let u2 = Wu[scu + 2u];
+            if (g == 0u) {
+                sdl =  u0        & 63u; sml =  u1        & 63u;
+                sdh = (u0 >>  8u) & 63u; smh = (u1 >>  8u) & 63u;
+            } else if (g == 1u) {
+                sdl = (u0 >> 16u) & 63u; sml = (u1 >> 16u) & 63u;
+                sdh = (u0 >> 24u) & 63u; smh = (u1 >> 24u) & 63u;
+            } else if (g == 2u) {
+                sdl = ( u2        & 0xFu) | (((u0 >>  6u) & 3u) << 4u);
+                sml = ((u2 >>  4u)& 0xFu) | (((u1 >>  6u) & 3u) << 4u);
+                sdh = ((u2 >>  8u)& 0xFu) | (((u0 >> 14u) & 3u) << 4u);
+                smh = ((u2 >> 12u)& 0xFu) | (((u1 >> 14u) & 3u) << 4u);
+            } else {
+                sdl = ((u2 >> 16u)& 0xFu) | (((u0 >> 22u) & 3u) << 4u);
+                sml = ((u2 >> 20u)& 0xFu) | (((u1 >> 22u) & 3u) << 4u);
+                sdh = ((u2 >> 24u)& 0xFu) | (((u0 >> 30u) & 3u) << 4u);
+                smh = ((u2 >> 28u)& 0xFu) | (((u1 >> 30u) & 3u) << 4u);
+            }
+            let d1u = d_u * f32(sdl); let m1u = dm_u * f32(sml);
+            let d2u = d_u * f32(sdh); let m2u = dm_u * f32(smh);
+            let qwu = Wu[(bs + 16u + g * 32u + u * 4u) >> 2u];
+            acc_u = acc_u + (d1u * f32( qwu         & 0xFu) - m1u) * f32(X_tile[elo + 0u]);
+            acc_u = acc_u + (d1u * f32((qwu >>  8u) & 0xFu) - m1u) * f32(X_tile[elo + 1u]);
+            acc_u = acc_u + (d1u * f32((qwu >> 16u) & 0xFu) - m1u) * f32(X_tile[elo + 2u]);
+            acc_u = acc_u + (d1u * f32((qwu >> 24u) & 0xFu) - m1u) * f32(X_tile[elo + 3u]);
+            acc_u = acc_u + (d2u * f32((qwu >>  4u) & 0xFu) - m2u) * f32(X_tile[ehi + 0u]);
+            acc_u = acc_u + (d2u * f32((qwu >> 12u) & 0xFu) - m2u) * f32(X_tile[ehi + 1u]);
+            acc_u = acc_u + (d2u * f32((qwu >> 20u) & 0xFu) - m2u) * f32(X_tile[ehi + 2u]);
+            acc_u = acc_u + (d2u * f32((qwu >> 28u) & 0xFu) - m2u) * f32(X_tile[ehi + 3u]);
+        }
+        workgroupBarrier();
+    }
+
+    /* Reduce gate & up partials. Assembler picks tree vs subgroup. */
+    /*[REDUCE_ACC_G]*/
+    /*[REDUCE_ACC_U]*/
+
+    if (thread_in_row == 0u && has_row) {
+        let gv = gate_val;
+        let gelu_g = 0.5 * gv * (1.0 + tanh(0.7978845608 * (gv + 0.044715 * gv * gv * gv)));
+        Y[row] = f16(gelu_g * up_val);
+    }
+}
+`;
+
+const Q5K_DOT_TILE = `
+fn dot_tile(rs: u32, t: u32, lid_x: u32) -> f32 {
+    let bs = rs + t * 176u;
+    let d  = hpk_to_f32(rb16(bs));
+    let dm = hpk_to_f32(rb16(bs + 2u));
+    var sc: array<u32, 12>;
+    for (var k = 0u; k < 12u; k = k + 1u) { sc[k] = rb(bs + 4u + k); }
+    var acc: f32 = 0.0;
+    for (var s = 0u; s < 2u; s = s + 1u) {
+        let e = lid_x + s * 128u;
+        let g = e >> 6u;
+        let sub = (e >> 5u) & 1u;
+        let l = e & 31u;
+        /* Q5_K: qh[l] has the 5th bit for low and high nibble across 4 groups.
+           The high-bit mask for (group g, sub-group sub) is bit 2*g + sub of qh[l]. */
+        let qho = bs + 16u;
+        let qlo = bs + 48u + g * 32u;
+        let qlv = rb(qlo + l);
+        let qhv = rb(qho + l);
+        let hi_bit = (qhv >> (g * 2u + sub)) & 1u;
+        var nib: u32;
+        if (sub == 0u) { nib = (qlv & 0xFu) + hi_bit * 16u; }
+        else           { nib = (qlv >> 4u)  + hi_bit * 16u; }
+        let ig = g * 2u + sub;
+        var sd: u32; var sm: u32;
+        if (ig < 4u) {
+            sd = sc[ig] & 63u;
+            sm = sc[ig + 4u] & 63u;
+        } else {
+            sd = (sc[ig + 4u] & 0xFu) | ((sc[ig - 4u] >> 6u) << 4u);
+            sm = (sc[ig + 4u] >> 4u)  | ((sc[ig] >> 6u) << 4u);
+        }
+        acc = acc + (d * f32(sd) * f32(nib) - dm * f32(sm)) * f32(X_tile[e]);
+    }
+    return acc;
+}
+`;
+
+/* Vectorized Q6_K matmul kernel — standalone, matches the Q4_K vectorized
+   thread layout (128 WG = 4 rows × 32 threads per row). Q6_K blocks are 210
+   bytes (not 4-aligned) so weight reads stay byte-level via rb(), but the
+   32-threads-per-row layout maps cleanly to a single NVIDIA warp for cheap
+   tree reduction and better warp-coherent memory access.
+
+   Thread t_r ∈ 0..31 within row:
+     hf = t_r >> 4            (0..1 half-block)
+     pt = (t_r >> 3) & 1      (0 → quadrants {0,2}; 1 → quadrants {1,3})
+     k  = t_r & 7             (0..7 chunk of 4 l-values)
+     l_base = k * 4
+   Each thread processes 4 l-values × 2 quadrants = 8 elements per tile. */
+const WGSL_MATMUL_Q6K_VEC = `
+fn sext8_q6v(v: u32) -> i32 {
+    if ((v & 0x80u) != 0u) { return i32(v) - 256; }
+    return i32(v);
+}
+@compute @workgroup_size(128, 1, 1)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    let row_in_wg     = lid.x >> 5u;
+    let thread_in_row = lid.x & 31u;
+    let row = wid.x * 4u + row_in_wg + P.row_base;
+    let has_row = row < P.n_out;
+    let nT = P.n_in >> 8u;
+    let rs = row * P.row_bytes;
+
+    let hf = thread_in_row >> 4u;
+    let pt = (thread_in_row >> 3u) & 1u;
+    let k  = thread_in_row & 7u;
+    let l_base = k * 4u;
+
+    let qb_a_shift = pt << 1u;              // pt=0 → 0 bits shift; pt=1 → 2 bits
+    let qb_b_shift = qb_a_shift + 4u;       // pt=0 → 4; pt=1 → 6
+    let ql_base_off = hf * 64u + pt * 32u;  // byte offset of ql inside block
+    let qh_base_off = 128u + hf * 32u;
+    let sc_base_off = 192u + hf * 8u;
+    let sc_sub_idx  = k >> 2u;              // 0 or 1 (l_base >> 4)
+
+    /* Element positions within the 256-element tile. qb_a is {0 or 1}, qb_b is {2 or 3}. */
+    let ea_base = hf * 128u + pt * 32u + l_base;
+    let eb_base = hf * 128u + pt * 32u + 64u + l_base;
+
+    var acc: f32 = 0.0;
+
+    for (var t = 0u; t < nT; t = t + 1u) {
+        let xbase = t * 256u;
+        let bi = lid.x * 2u;
+        X_tile[bi + 0u] = X[xbase + bi + 0u];
+        X_tile[bi + 1u] = X[xbase + bi + 1u];
+        workgroupBarrier();
+
+        if (has_row) {
+            let bo = rs + t * 210u;
+            let d = hpk_to_f32(rb16(bo + 208u));
+
+            let sc_a = sext8_q6v(rb(bo + sc_base_off + pt * 2u + sc_sub_idx));
+            let sc_b = sext8_q6v(rb(bo + sc_base_off + (pt + 2u) * 2u + sc_sub_idx));
+            let da = d * f32(sc_a);
+            let db = d * f32(sc_b);
+
+            for (var i = 0u; i < 4u; i = i + 1u) {
+                let qlv = rb(bo + ql_base_off + l_base + i);
+                let qhv = rb(bo + qh_base_off + l_base + i);
+                let q_a = i32((qlv & 0xFu) | (((qhv >> qb_a_shift) & 3u) << 4u)) - 32;
+                let q_b = i32((qlv >> 4u)  | (((qhv >> qb_b_shift) & 3u) << 4u)) - 32;
+                acc = acc + da * f32(q_a) * f32(X_tile[ea_base + i]);
+                acc = acc + db * f32(q_b) * f32(X_tile[eb_base + i]);
+            }
+        }
+        workgroupBarrier();
+    }
+
+    /*[REDUCE_ROW]*/
+}
+`;
+
+const Q6K_DOT_TILE = `
+fn sext8(v: u32) -> i32 {
+    if ((v & 0x80u) != 0u) { return i32(v) - 256; }
+    return i32(v);
+}
+fn dot_tile(rs: u32, t: u32, lid_x: u32) -> f32 {
+    let bo = rs + t * 210u;
+    let d  = hpk_to_f32(rb16(bo + 208u));
+    var acc: f32 = 0.0;
+    for (var s = 0u; s < 2u; s = s + 1u) {
+        let e = lid_x + s * 128u;
+        /* Q6_K layout: 2 half-blocks (hf=0 for e<128, hf=1 for e>=128).
+           Each half-block: 4 quadrants of 32 elements. Quadrant qb ∈ {0,1,2,3}:
+             0 → ql[l]      low nibble  + qh[l] bits 0-1
+             1 → ql[32+l]   low nibble  + qh[l] bits 2-3
+             2 → ql[l]      high nibble + qh[l] bits 4-5
+             3 → ql[32+l]   high nibble + qh[l] bits 6-7
+           Scale index within half-block: qb*2 + (l>>4). */
+        let hf  = e >> 7u;        // 0 or 1
+        let rel = e & 127u;       // 0..127
+        let qb  = rel >> 5u;      // 0..3
+        let l   = rel & 31u;      // 0..31
+        let qlo = bo + hf * 64u;
+        let qho = bo + 128u + hf * 32u;
+        let sco = bo + 192u + hf * 8u;
+        let sc_idx = qb * 2u + (l >> 4u);
+        let scale = sext8(rb(sco + sc_idx));
+        let qhv = rb(qho + l);
+        var q_raw: i32;
+        if (qb == 0u) {
+            let qlv = rb(qlo + l);
+            q_raw = i32((qlv & 0xFu) | (((qhv >> 0u) & 3u) << 4u)) - 32;
+        } else if (qb == 1u) {
+            let qlv = rb(qlo + 32u + l);
+            q_raw = i32((qlv & 0xFu) | (((qhv >> 2u) & 3u) << 4u)) - 32;
+        } else if (qb == 2u) {
+            let qlv = rb(qlo + l);
+            q_raw = i32((qlv >> 4u)  | (((qhv >> 4u) & 3u) << 4u)) - 32;
+        } else {
+            let qlv = rb(qlo + 32u + l);
+            q_raw = i32((qlv >> 4u)  | (((qhv >> 6u) & 3u) << 4u)) - 32;
+        }
+        acc = acc + d * f32(scale) * f32(q_raw) * f32(X_tile[e]);
+    }
+    return acc;
+}
+`;
+
+const IQ4XS_DOT_TILE = `
+const IQ4NL = array<i32, 16>(-127,-104,-83,-65,-49,-35,-22,-10,1,13,25,38,53,69,89,113);
+fn dot_tile(rs: u32, t: u32, lid_x: u32) -> f32 {
+    let bo = rs + t * 136u;
+    let d  = hpk_to_f32(rb16(bo));
+    let sh = rb16(bo + 2u);
+    var slb: array<u32, 4>;
+    for (var k = 0u; k < 4u; k = k + 1u) { slb[k] = rb(bo + 4u + k); }
+    var acc: f32 = 0.0;
+    for (var s = 0u; s < 2u; s = s + 1u) {
+        let e = lid_x + s * 128u;
+        /* IQ4_XS: 8 sub-blocks of 32 elements. Even/odd of a byte store
+           adjacent 16-wide halves. Element e → (ib = e/32, bit = (e/16)&1,
+           byte within sub-block = e&15). */
+        let ib = e >> 5u;
+        let hi = (e >> 4u) & 1u;
+        let bi = e & 15u;
+        let ls = ((slb[ib >> 1u] >> ((ib & 1u) * 4u)) & 0xFu) | (((sh >> (ib * 2u)) & 3u) << 4u);
+        let dl = d * f32(i32(ls) - 32);
+        let qv = rb(bo + 8u + ib * 16u + bi);
+        var nib: u32;
+        if (hi == 0u) { nib = qv & 0xFu; } else { nib = qv >> 4u; }
+        acc = acc + dl * f32(IQ4NL[nib]) * f32(X_tile[e]);
+    }
+    return acc;
+}
+`;
+
+const F16_DOT_TILE = `
+fn dot_tile(rs: u32, t: u32, lid_x: u32) -> f32 {
+    let base = rs + t * ${TILE * 2}u;
+    var acc: f32 = 0.0;
+    for (var s = 0u; s < 2u; s = s + 1u) {
+        let e = lid_x + s * 128u;
+        acc = acc + hpk_to_f32(rb16(base + e * 2u)) * f32(X_tile[e]);
+    }
+    return acc;
+}
+`;
+
+const BF16_DOT_TILE = `
+fn dot_tile(rs: u32, t: u32, lid_x: u32) -> f32 {
+    let base = rs + t * ${TILE * 2}u;
+    var acc: f32 = 0.0;
+    for (var s = 0u; s < 2u; s = s + 1u) {
+        let e = lid_x + s * 128u;
+        acc = acc + bpk_to_f32(rb16(base + e * 2u)) * f32(X_tile[e]);
+    }
+    return acc;
+}
+`;
+
+const F32_DOT_TILE = `
+fn dot_tile(rs: u32, t: u32, lid_x: u32) -> f32 {
+    let base = rs + t * ${TILE * 4}u;
+    var acc: f32 = 0.0;
+    for (var s = 0u; s < 2u; s = s + 1u) {
+        let e = lid_x + s * 128u;
+        let word = W[(base + e * 4u) >> 2u];
+        acc = acc + bitcast<f32>(word) * f32(X_tile[e]);
+    }
+    return acc;
+}
+`;
+
+/* Kernel assembly is deferred to initWebGPU(), where the adapter's feature
+   set is known. assembleMatmulKernels(hasSubgroups) returns the 7 WGSL strings. */
+function assembleMatmulKernels(hasSubgroups) {
+    const enables  = hasSubgroups ? `enable subgroups;\n` : ``;
+    const epilogue = hasSubgroups ? WGSL_TILED_EPILOGUE_SG : WGSL_TILED_EPILOGUE_TREE;
+    const make    = (dotTile) => enables + WGSL_TILED_PROLOGUE + dotTile + epilogue;
+    /* Vectorized kernels: substitute the REDUCE_ROW / REDUCE_ACC_* sentinels
+       with either subgroupAdd (1 instruction, needs sg_size==32) or the
+       portable tree reduction. */
+    const redRow = hasSubgroups ? SG_REDUCE_ROW_32 : TREE_REDUCE_ROW_32;
+    const redG   = hasSubgroups ? SG_REDUCE_ACC_G  : TREE_REDUCE_ACC_G;
+    const redU   = hasSubgroups ? SG_REDUCE_ACC_U  : TREE_REDUCE_ACC_U;
+    const applyReds = (src) => src
+        .replace('/*[REDUCE_ROW]*/',   redRow)
+        .replace('/*[REDUCE_ACC_G]*/', redG)
+        .replace('/*[REDUCE_ACC_U]*/', redU);
+    const makeVec = (body) => enables + WGSL_TILED_PROLOGUE + applyReds(body);
+    return {
+        q4k:   makeVec(WGSL_MATMUL_Q4K_VEC),
+        q5k:   make(Q5K_DOT_TILE),
+        q6k:   makeVec(WGSL_MATMUL_Q6K_VEC),
+        iq4xs: make(IQ4XS_DOT_TILE),
+        f16:   make(F16_DOT_TILE),
+        bf16:  make(BF16_DOT_TILE),
+        f32:   make(F32_DOT_TILE),
+    };
+}
+
+/* RMSNorm out-of-place: Out[base+i] = Xin[base+i] * rsqrt(mean(x^2)+eps) * Win[i] (if mode==0)
+   Different buffers for input and output. */
+const WG_NORM = 128;
+const WGSL_RMSNORM_OP = `
+enable f16;
+struct Params { n: u32, eps_bits: u32, mode: u32, _pad: u32 };
+@group(0) @binding(0) var<storage, read>       Xin: array<f16>;
+@group(0) @binding(1) var<storage, read>       Win: array<f32>;
+@group(0) @binding(2) var<storage, read_write> Out: array<f16>;
+@group(0) @binding(3) var<uniform>             P:   Params;
+var<workgroup> part: array<f32, ${WG_NORM}u>;
+@compute @workgroup_size(${WG_NORM}, 1, 1)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    let base = wid.x * P.n;
+    var ss: f32 = 0.0;
+    for (var i = lid.x; i < P.n; i = i + ${WG_NORM}u) {
+        let v = f32(Xin[base + i]);
+        ss = ss + v * v;
+    }
+    part[lid.x] = ss;
+    workgroupBarrier();
+    var stride: u32 = ${WG_NORM}u >> 1u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid.x < stride) { part[lid.x] = part[lid.x] + part[lid.x + stride]; }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+    let eps = bitcast<f32>(P.eps_bits);
+    let inv = 1.0 / sqrt(part[0] / f32(P.n) + eps);
+    for (var i = lid.x; i < P.n; i = i + ${WG_NORM}u) {
+        let v = f32(Xin[base + i]) * inv;
+        if (P.mode == 0u) { Out[base + i] = f16(v * Win[i]); }
+        else              { Out[base + i] = f16(v); }
+    }
+}
+`;
+
+/* RMSNorm in-place variant. Binding 0 is the read_write activation buffer. */
+const WGSL_RMSNORM_IP = `
+enable f16;
+struct Params { n: u32, eps_bits: u32, mode: u32, _pad: u32 };
+@group(0) @binding(0) var<storage, read_write> X:   array<f16>;
+@group(0) @binding(1) var<storage, read>       Win: array<f32>;
+@group(0) @binding(2) var<uniform>             P:   Params;
+var<workgroup> part: array<f32, ${WG_NORM}u>;
+@compute @workgroup_size(${WG_NORM}, 1, 1)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    let base = wid.x * P.n;
+    var ss: f32 = 0.0;
+    for (var i = lid.x; i < P.n; i = i + ${WG_NORM}u) {
+        let v = f32(X[base + i]);
+        ss = ss + v * v;
+    }
+    part[lid.x] = ss;
+    workgroupBarrier();
+    var stride: u32 = ${WG_NORM}u >> 1u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid.x < stride) { part[lid.x] = part[lid.x] + part[lid.x + stride]; }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+    let eps = bitcast<f32>(P.eps_bits);
+    let inv = 1.0 / sqrt(part[0] / f32(P.n) + eps);
+    for (var i = lid.x; i < P.n; i = i + ${WG_NORM}u) {
+        let v = f32(X[base + i]) * inv;
+        if (P.mode == 0u) { X[base + i] = f16(v * Win[i]); }
+        else              { X[base + i] = f16(v); }
+    }
+}
+`;
+
+/* Fused post-residual rmsnorm: x[i] += rmsnorm(xb[i], W). Replaces the pair
+   rmsnorm(xb→xb) + add(x,xb) at post-attn, post-ffn, and post-PLE residual
+   points. Bindings match the rmsOp layout (binding 0 ro, 1 ro, 2 rw, 3 uni),
+   just with roles: B=xb read-only, W=weight, A=x read-write. */
+const WGSL_ADD_RMSNORM = `
+enable f16;
+struct Params { n: u32, eps_bits: u32, _pad0: u32, _pad1: u32 };
+@group(0) @binding(0) var<storage, read>       B: array<f16>;
+@group(0) @binding(1) var<storage, read>       W: array<f32>;
+@group(0) @binding(2) var<storage, read_write> A: array<f16>;
+@group(0) @binding(3) var<uniform>             P: Params;
+var<workgroup> ar: array<f32, ${WG_NORM}u>;
+@compute @workgroup_size(${WG_NORM}, 1, 1)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    let base = wid.x * P.n;
+    var ss: f32 = 0.0;
+    for (var i = lid.x; i < P.n; i = i + ${WG_NORM}u) {
+        let v = f32(B[base + i]);
+        ss = ss + v * v;
+    }
+    ar[lid.x] = ss;
+    workgroupBarrier();
+    var s: u32 = ${WG_NORM}u >> 1u;
+    loop {
+        if (s == 0u) { break; }
+        if (lid.x < s) { ar[lid.x] = ar[lid.x] + ar[lid.x + s]; }
+        workgroupBarrier();
+        s = s >> 1u;
+    }
+    let eps = bitcast<f32>(P.eps_bits);
+    let inv = 1.0 / sqrt(ar[0] / f32(P.n) + eps);
+    for (var i = lid.x; i < P.n; i = i + ${WG_NORM}u) {
+        let normed = f32(B[base + i]) * inv * W[i];
+        A[base + i] = f16(f32(A[base + i]) + normed);
+    }
+}
+`;
+
+/* RoPE rotation on a vector of shape [n_vec_groups, head_dim]. One workgroup per group.
+   Uses half-split rotation: vec[i] = x0*cos - x1*sin; vec[i+half] = x0*sin + x1*cos
+   for i in [0, n_pairs). freq = theta_base^(-2i/n_rot). optional freq_factors. */
+const WG_ROPE = 64;
+const WGSL_ROPE = `
+enable f16;
+struct Params {
+    head_dim: u32, n_rot: u32, pos: u32, use_ff: u32,
+    theta_bits: u32, _pad0: u32, _pad1: u32, _pad2: u32,
+};
+@group(0) @binding(0) var<storage, read_write> V:  array<f16>;
+@group(0) @binding(1) var<storage, read>       FF: array<f32>;
+@group(0) @binding(2) var<uniform>             P:  Params;
+@compute @workgroup_size(${WG_ROPE}, 1, 1)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    let base = wid.x * P.head_dim;
+    let half = P.head_dim >> 1u;
+    let n_pairs = P.n_rot >> 1u;
+    let theta_base = bitcast<f32>(P.theta_bits);
+    let pos_f = f32(P.pos);
+    for (var i = lid.x; i < n_pairs; i = i + ${WG_ROPE}u) {
+        var freq = pow(theta_base, -2.0 * f32(i) / f32(P.n_rot));
+        if (P.use_ff == 1u) { freq = freq * FF[i]; }
+        let ang = pos_f * freq;
+        let c = cos(ang);
+        let s = sin(ang);
+        let x0 = f32(V[base + i]);
+        let x1 = f32(V[base + i + half]);
+        V[base + i]        = f16(x0 * c - x1 * s);
+        V[base + i + half] = f16(x0 * s + x1 * c);
+    }
+}
+`;
+
+/* RoPE fused with KV cache slice-copy. Reads src (kBuf), applies per-head RoPE
+   in the rotated-pair range, and writes the full head_dim output straight into
+   DST (kvK[il]) at cache_offset. Unrotated elements (when n_rot < head_dim) are
+   passed through as plain copies. Replaces the separate rope + slice_copy pair. */
+const WGSL_ROPE_TO_CACHE = `
+enable f16;
+struct Params {
+    head_dim: u32, n_rot: u32, pos: u32, use_ff: u32,
+    theta_bits: u32, cache_offset: u32, _pad0: u32, _pad1: u32,
+};
+@group(0) @binding(0) var<storage, read>       SRC: array<f16>;
+@group(0) @binding(1) var<storage, read>       FF:  array<f32>;
+@group(0) @binding(2) var<storage, read_write> DST: array<f16>;
+@group(0) @binding(3) var<uniform>             P:   Params;
+@compute @workgroup_size(${WG_ROPE}, 1, 1)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    let base_in  = wid.x * P.head_dim;
+    let base_out = P.cache_offset + wid.x * P.head_dim;
+    let half = P.head_dim >> 1u;
+    let n_pairs = P.n_rot >> 1u;
+    let theta_base = bitcast<f32>(P.theta_bits);
+    let pos_f = f32(P.pos);
+
+    /* Rotated pairs: write both halves of each pair. */
+    for (var i = lid.x; i < n_pairs; i = i + ${WG_ROPE}u) {
+        var freq = pow(theta_base, -2.0 * f32(i) / f32(P.n_rot));
+        if (P.use_ff == 1u) { freq = freq * FF[i]; }
+        let ang = pos_f * freq;
+        let c = cos(ang);
+        let s = sin(ang);
+        let x0 = f32(SRC[base_in + i]);
+        let x1 = f32(SRC[base_in + i + half]);
+        DST[base_out + i]        = f16(x0 * c - x1 * s);
+        DST[base_out + i + half] = f16(x0 * s + x1 * c);
+    }
+    /* Unrotated middle slice [n_pairs, half). */
+    for (var i = lid.x + n_pairs; i < half; i = i + ${WG_ROPE}u) {
+        DST[base_out + i] = SRC[base_in + i];
+    }
+    /* Unrotated upper slice [half + n_pairs, head_dim). */
+    for (var i = lid.x + half + n_pairs; i < P.head_dim; i = i + ${WG_ROPE}u) {
+        DST[base_out + i] = SRC[base_in + i];
+    }
+}
+`;
+
+/* RMSNorm (no weight) fused with KV cache write. Reads vBuf, applies
+   out[j] = v[j] * rsqrt(mean(v^2)+eps), writes directly to kvV[il] at
+   cache_offset. Replaces the separate in-place rmsnorm + slice_copy pair. */
+const WGSL_RMSNORM_TO_CACHE = `
+enable f16;
+struct Params {
+    n: u32, eps_bits: u32, cache_offset: u32, _pad: u32,
+};
+@group(0) @binding(0) var<storage, read>       SRC: array<f16>;
+@group(0) @binding(1) var<storage, read>       _UNUSED: array<f32>;
+@group(0) @binding(2) var<storage, read_write> DST: array<f16>;
+@group(0) @binding(3) var<uniform>             P:   Params;
+var<workgroup> nred: array<f32, ${WG_NORM}u>;
+@compute @workgroup_size(${WG_NORM}, 1, 1)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    let base_in  = wid.x * P.n;
+    let base_out = P.cache_offset + wid.x * P.n;
+    var ss: f32 = 0.0;
+    for (var i = lid.x; i < P.n; i = i + ${WG_NORM}u) {
+        let v = f32(SRC[base_in + i]);
+        ss = ss + v * v;
+    }
+    nred[lid.x] = ss;
+    workgroupBarrier();
+    var stride: u32 = ${WG_NORM}u >> 1u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid.x < stride) { nred[lid.x] = nred[lid.x] + nred[lid.x + stride]; }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+    let eps = bitcast<f32>(P.eps_bits);
+    let inv = 1.0 / sqrt(nred[0] / f32(P.n) + eps);
+    for (var i = lid.x; i < P.n; i = i + ${WG_NORM}u) {
+        DST[base_out + i] = f16(f32(SRC[base_in + i]) * inv);
+    }
+}
+`;
+
+/* Per-head softmax: each workgroup softmaxes a slice of length 'len' starting at head*stride. */
+const WG_SOFT = 128;
+const WGSL_SOFTMAX = `
+struct Params { stride: u32, len: u32 };
+@group(0) @binding(0) var<storage, read_write> V: array<f32>;
+@group(0) @binding(1) var<uniform>             P: Params;
+var<workgroup> redF: array<f32, ${WG_SOFT}u>;
+@compute @workgroup_size(${WG_SOFT}, 1, 1)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    let base = wid.x * P.stride;
+    var mx: f32 = -3.4e38;
+    for (var i = lid.x; i < P.len; i = i + ${WG_SOFT}u) {
+        let v = V[base + i];
+        if (v > mx) { mx = v; }
+    }
+    redF[lid.x] = mx;
+    workgroupBarrier();
+    var stride: u32 = ${WG_SOFT}u >> 1u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid.x < stride) {
+            if (redF[lid.x + stride] > redF[lid.x]) { redF[lid.x] = redF[lid.x + stride]; }
+        }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+    let maxv = redF[0];
+    var sum: f32 = 0.0;
+    for (var i = lid.x; i < P.len; i = i + ${WG_SOFT}u) {
+        let e = exp(V[base + i] - maxv);
+        V[base + i] = e;
+        sum = sum + e;
+    }
+    workgroupBarrier();
+    redF[lid.x] = sum;
+    workgroupBarrier();
+    stride = ${WG_SOFT}u >> 1u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid.x < stride) { redF[lid.x] = redF[lid.x] + redF[lid.x + stride]; }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+    let total = redF[0];
+    for (var i = lid.x; i < P.len; i = i + ${WG_SOFT}u) {
+        V[base + i] = V[base + i] / total;
+    }
+}
+`;
+
+/* Attention: compute raw scores scores[h*stride + t] = dot(q[h], k[kvH, ci(t), :]).
+   q is laid out as [nh, hd]; k cache as [kv_cache_len, kv_dim] with kv_dim = src_nkv*src_hd.
+   Per head h we use src_kv_h = h / (nh/src_nkv). dot length = min(hd, src_hd).
+   SWA indexing: ci = src_is_swa ? (kv_start+t) % sliding_window : kv_start+t */
+const WG_ATTN = 64;
+const WGSL_ATTN_SCORES = `
+enable f16;
+struct Params {
+    nh: u32, hd: u32, src_hd: u32, src_nkv: u32,
+    kv_start: u32, kv_len: u32, src_swa: u32, sliding_window: u32,
+    stride: u32, dd: u32, _pad0: u32, _pad1: u32,
+};
+@group(0) @binding(0) var<storage, read>       Q:  array<f16>;
+@group(0) @binding(1) var<storage, read>       KC: array<f16>;
+@group(0) @binding(2) var<storage, read_write> SC: array<f32>;
+@group(0) @binding(3) var<uniform>             P:  Params;
+var<workgroup> part: array<f32, ${WG_ATTN}u>;
+@compute @workgroup_size(${WG_ATTN}, 1, 1)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    let h = wid.x;
+    let t = wid.y;
+    if (h >= P.nh || t >= P.kv_len) { return; }
+    let kv_h = h / (P.nh / P.src_nkv);
+    let kv_dim = P.src_nkv * P.src_hd;
+    var ci: u32;
+    if (P.src_swa == 1u) { ci = (P.kv_start + t) % P.sliding_window; }
+    else                 { ci = P.kv_start + t; }
+    let qbase = h * P.hd;
+    let kbase = ci * kv_dim + kv_h * P.src_hd;
+    var sum: f32 = 0.0;
+    for (var j = lid.x; j < P.dd; j = j + ${WG_ATTN}u) {
+        sum = sum + f32(Q[qbase + j]) * f32(KC[kbase + j]);
+    }
+    part[lid.x] = sum;
+    workgroupBarrier();
+    var stride: u32 = ${WG_ATTN}u >> 1u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid.x < stride) { part[lid.x] = part[lid.x] + part[lid.x + stride]; }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+    if (lid.x == 0u) { SC[h * P.stride + t] = part[0]; }
+}
+`;
+
+/* Attention value: out[h, j] = sum_t scores[h, t] * V[ci(t), kv_h*src_hd + j] for j < dd */
+const WGSL_ATTN_VALUE = `
+enable f16;
+struct Params {
+    nh: u32, hd: u32, src_hd: u32, src_nkv: u32,
+    kv_start: u32, kv_len: u32, src_swa: u32, sliding_window: u32,
+    stride: u32, vd: u32, _pad0: u32, _pad1: u32,
+};
+@group(0) @binding(0) var<storage, read>       SC:  array<f32>;
+@group(0) @binding(1) var<storage, read>       VC:  array<f16>;
+@group(0) @binding(2) var<storage, read_write> OUT: array<f16>;
+@group(0) @binding(3) var<uniform>             P:   Params;
+@compute @workgroup_size(${WG_ATTN}, 1, 1)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    let h = wid.x;
+    if (h >= P.nh) { return; }
+    let kv_h = h / (P.nh / P.src_nkv);
+    let kv_dim = P.src_nkv * P.src_hd;
+    let obase = h * P.hd;
+    let sbase = h * P.stride;
+    for (var j = lid.x; j < P.vd; j = j + ${WG_ATTN}u) {
+        var acc: f32 = 0.0;
+        for (var t = 0u; t < P.kv_len; t = t + 1u) {
+            var ci: u32;
+            if (P.src_swa == 1u) { ci = (P.kv_start + t) % P.sliding_window; }
+            else                 { ci = P.kv_start + t; }
+            acc = acc + SC[sbase + t] * f32(VC[ci * kv_dim + kv_h * P.src_hd + j]);
+        }
+        OUT[obase + j] = f16(acc);
+    }
+    if (P.hd > P.vd) {
+        for (var j = P.vd + lid.x; j < P.hd; j = j + ${WG_ATTN}u) {
+            OUT[obase + j] = f16(0.0);
+        }
+    }
+}
+`;
+
+/* Flash Attention: single fused kernel replacing attn_scores + softmax + attn_value.
+   One workgroup per head. Streaming loop over kv_len with online softmax (running
+   max m and normalizer L). Keeps per-thread output accumulators in registers — no
+   scores buffer materialized. On this model (nh=4) only 4 workgroups launch, but
+   each does 3x the work of the previous split so dispatch/barrier overhead drops. */
+const WGSL_FLASH_ATTN = `
+enable f16;
+struct Params {
+    nh: u32, hd: u32, src_hd: u32, src_nkv: u32,
+    kv_start: u32, kv_len: u32, src_swa: u32, sliding_window: u32,
+};
+@group(0) @binding(0) var<storage, read>       Q:  array<f16>;
+@group(0) @binding(1) var<storage, read>       KC: array<f16>;
+@group(0) @binding(2) var<storage, read>       VC: array<f16>;
+@group(0) @binding(3) var<storage, read_write> OUT: array<f16>;
+@group(0) @binding(4) var<uniform>             P:  Params;
+
+const WG_FA = 128u;
+const MAX_HD = 512u;
+
+var<workgroup> q_shared:    array<f16, MAX_HD>;
+var<workgroup> red_fa:      array<f32, WG_FA>;
+var<workgroup> score_shared: f32;
+
+@compute @workgroup_size(128, 1, 1)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    let h = wid.x;
+    if (h >= P.nh) { return; }
+    let kv_h  = h / (P.nh / P.src_nkv);
+    let kv_dim = P.src_nkv * P.src_hd;
+    let dd = min(P.hd, P.src_hd);
+    let vd = dd;
+
+    /* Cache Q[h] in workgroup memory so we don't re-read each timestep. */
+    for (var j = lid.x; j < dd; j = j + WG_FA) {
+        q_shared[j] = Q[h * P.hd + j];
+    }
+    workgroupBarrier();
+
+    /* Per-thread output accumulator (up to ceil(hd/128)=4 elements per thread
+       for hd=512) and per-thread (identical across threads) softmax state. */
+    var o: array<f32, 4>;
+    for (var k = 0u; k < 4u; k = k + 1u) { o[k] = 0.0; }
+    var m_val: f32 = -3.4e38;
+    var L_val: f32 = 0.0;
+
+    for (var t = 0u; t < P.kv_len; t = t + 1u) {
+        var ci: u32;
+        if (P.src_swa == 1u) { ci = (P.kv_start + t) % P.sliding_window; }
+        else                 { ci = P.kv_start + t; }
+        let kv_base = ci * kv_dim + kv_h * P.src_hd;
+
+        /* Score = dot(q, K[t, kv_h, :]). */
+        var partial: f32 = 0.0;
+        for (var j = lid.x; j < dd; j = j + WG_FA) {
+            partial = partial + f32(q_shared[j]) * f32(KC[kv_base + j]);
+        }
+        /*[REDUCE_SCORE]*/
+        let s = score_shared;
+
+        /* Online softmax update — all threads compute identical m/L because they
+           start from the same state and read the same reduced score. */
+        let m_new = max(m_val, s);
+        let alpha = exp(m_val - m_new);
+        let beta  = exp(s - m_new);
+        m_val = m_new;
+        L_val = L_val * alpha + beta;
+
+        /* o[j] = o[j] * alpha + V[t, kv_h, j] * beta (per owned output dim). */
+        for (var k = 0u; k < 4u; k = k + 1u) {
+            let j = lid.x + k * WG_FA;
+            if (j < vd) {
+                o[k] = o[k] * alpha + f32(VC[kv_base + j]) * beta;
+            }
+        }
+    }
+
+    /* Normalize and write. */
+    let inv_L = 1.0 / L_val;
+    for (var k = 0u; k < 4u; k = k + 1u) {
+        let j = lid.x + k * WG_FA;
+        if (j < vd) {
+            OUT[h * P.hd + j] = f16(o[k] * inv_L);
+        }
+    }
+    /* Zero-pad when hd > vd (GQA with larger query head dim). */
+    if (P.hd > vd) {
+        for (var j = vd + lid.x; j < P.hd; j = j + WG_FA) {
+            OUT[h * P.hd + j] = f16(0.0);
+        }
+    }
+}
+`;
+
+/* Two variants of the 128-thread → 1 score reduction inside the FA hot loop. */
+const TREE_REDUCE_SCORE = `
+        red_fa[lid.x] = partial;
+        workgroupBarrier();
+        var stride_fa: u32 = WG_FA >> 1u;
+        loop {
+            if (stride_fa == 0u) { break; }
+            if (lid.x < stride_fa) { red_fa[lid.x] = red_fa[lid.x] + red_fa[lid.x + stride_fa]; }
+            workgroupBarrier();
+            stride_fa = stride_fa >> 1u;
+        }
+        if (lid.x == 0u) { score_shared = red_fa[0]; }
+        workgroupBarrier();
+`;
+const SG_REDUCE_SCORE = `
+        let warp_partial = subgroupAdd(partial);
+        if ((lid.x & 31u) == 0u) { red_fa[lid.x >> 5u] = warp_partial; }
+        workgroupBarrier();
+        if (lid.x == 0u) {
+            var total_fa: f32 = 0.0;
+            for (var w = 0u; w < (WG_FA >> 5u); w = w + 1u) { total_fa = total_fa + red_fa[w]; }
+            score_shared = total_fa;
+        }
+        workgroupBarrier();
+`;
+
+/* All activation-buffer kernels use f16 storage; math promotes to f32 to keep
+   accumulator precision, then narrows back on store. */
+const WG_ELEM = 256;
+const WGSL_GELU_MUL = `
+enable f16;
+struct Params { n: u32, _pad: u32 };
+@group(0) @binding(0) var<storage, read_write> A: array<f16>;
+@group(0) @binding(1) var<storage, read>       B: array<f16>;
+@group(0) @binding(2) var<uniform>             P: Params;
+@compute @workgroup_size(${WG_ELEM}, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= P.n) { return; }
+    let x = f32(A[i]);
+    let g = 0.5 * x * (1.0 + tanh(0.7978845608 * (x + 0.044715 * x * x * x)));
+    A[i] = f16(g * f32(B[i]));
+}
+`;
+
+const WGSL_GELU = `
+enable f16;
+struct Params { n: u32, _pad: u32 };
+@group(0) @binding(0) var<storage, read_write> A: array<f16>;
+@group(0) @binding(1) var<uniform>             P: Params;
+@compute @workgroup_size(${WG_ELEM}, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= P.n) { return; }
+    let x = f32(A[i]);
+    A[i] = f16(0.5 * x * (1.0 + tanh(0.7978845608 * (x + 0.044715 * x * x * x))));
+}
+`;
+
+const WGSL_ADD = `
+enable f16;
+struct Params { n: u32, _pad: u32 };
+@group(0) @binding(0) var<storage, read_write> A: array<f16>;
+@group(0) @binding(1) var<storage, read>       B: array<f16>;
+@group(0) @binding(2) var<uniform>             P: Params;
+@compute @workgroup_size(${WG_ELEM}, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= P.n) { return; }
+    A[i] = f16(f32(A[i]) + f32(B[i]));
+}
+`;
+
+const WGSL_MUL = `
+enable f16;
+struct Params { n: u32, _pad: u32 };
+@group(0) @binding(0) var<storage, read_write> A: array<f16>;
+@group(0) @binding(1) var<storage, read>       B: array<f16>;
+@group(0) @binding(2) var<uniform>             P: Params;
+@compute @workgroup_size(${WG_ELEM}, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= P.n) { return; }
+    A[i] = f16(f32(A[i]) * f32(B[i]));
+}
+`;
+
+const WGSL_SCALE = `
+enable f16;
+struct Params { n: u32, s_bits: u32 };
+@group(0) @binding(0) var<storage, read_write> A: array<f16>;
+@group(0) @binding(1) var<uniform>             P: Params;
+@compute @workgroup_size(${WG_ELEM}, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= P.n) { return; }
+    A[i] = f16(f32(A[i]) * bitcast<f32>(P.s_bits));
+}
+`;
+
+/* Softcap operates on logits (also f16). Keep math in f32 for range. */
+const WGSL_SOFTCAP = `
+enable f16;
+struct Params { n: u32, s_bits: u32 };
+@group(0) @binding(0) var<storage, read_write> A: array<f16>;
+@group(0) @binding(1) var<uniform>             P: Params;
+@compute @workgroup_size(${WG_ELEM}, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= P.n) { return; }
+    let s = bitcast<f32>(P.s_bits);
+    A[i] = f16(tanh(f32(A[i]) / s) * s);
+}
+`;
+
+const WGSL_ADD_SCALE = `
+enable f16;
+struct Params { n: u32, s_bits: u32 };
+@group(0) @binding(0) var<storage, read_write> A: array<f16>;
+@group(0) @binding(1) var<storage, read>       B: array<f16>;
+@group(0) @binding(2) var<uniform>             P: Params;
+@compute @workgroup_size(${WG_ELEM}, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= P.n) { return; }
+    A[i] = f16((f32(A[i]) + f32(B[i])) * bitcast<f32>(P.s_bits));
+}
+`;
+
+const WGSL_SLICE_COPY = `
+enable f16;
+struct Params { n: u32, src_off: u32, dst_off: u32, _pad: u32 };
+@group(0) @binding(0) var<storage, read>       S: array<f16>;
+@group(0) @binding(1) var<storage, read_write> D: array<f16>;
+@group(0) @binding(2) var<uniform>             P: Params;
+@compute @workgroup_size(${WG_ELEM}, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= P.n) { return; }
+    D[P.dst_off + i] = S[P.src_off + i];
+}
+`;
+
+/* ================================================================
+   SECTION 7: WebGPU setup & pipeline registry
+   ================================================================ */
+
+let GPU = null;  /* { adapter, device, pipelines, bindLayouts, uniformRing, ringOffset } */
+
+const UNIFORM_SLOT = 256;   /* dynamic offset must be multiple of 256 */
+const UNIFORM_SLOTS = 2048; /* 512KB ring; ~800 dispatches per token with headroom */
+
+async function initWebGPU() {
+    if (!navigator.gpu) throw new Error('WebGPU not supported in this browser');
+    /* Detect software/fallback: either the flag is true, OR the adapter info identifies
+       SwiftShader / lavapipe / llvmpipe / WARP (various software rasterizers). */
+    const isSoftware = (a) => {
+        if (!a) return false;
+        if (a.isFallbackAdapter === true) return true;
+        const i = a.info || {};
+        const tag = `${i.vendor||''} ${i.architecture||''} ${i.device||''} ${i.description||''}`.toLowerCase();
+        return /swiftshader|llvmpipe|lavapipe|software|warp|microsoft basic/.test(tag);
+    };
+    const tries = [
+        { powerPreference: 'high-performance' },
+        { powerPreference: 'low-power' },
+        {},
+    ];
+    let adapter = null;
+    for (const opts of tries) {
+        const a = await navigator.gpu.requestAdapter(opts);
+        console.log('[WebGPU] requestAdapter', opts, '→',
+                    a ? { isFallback: a.isFallbackAdapter, info: a.info, software: isSoftware(a) } : 'null');
+        if (a && !isSoftware(a)) { adapter = a; break; }
+        if (a && !adapter) adapter = a;  /* keep fallback as last resort */
+    }
+    if (!adapter) throw new Error('No WebGPU adapter available');
+    if (isSoftware(adapter)) {
+        console.warn('[WebGPU] Only a SOFTWARE adapter is available. Chrome is not giving this page ' +
+                     'a hardware GPU adapter. On Linux enable chrome://flags/#enable-vulkan and relaunch.');
+    }
+
+    const aLim = adapter.limits;
+    const requiredLimits = {
+        maxBufferSize: aLim.maxBufferSize,
+        maxStorageBufferBindingSize: aLim.maxStorageBufferBindingSize,
+        maxComputeWorkgroupStorageSize: aLim.maxComputeWorkgroupStorageSize,
+        maxComputeInvocationsPerWorkgroup: aLim.maxComputeInvocationsPerWorkgroup,
+        maxComputeWorkgroupSizeX: aLim.maxComputeWorkgroupSizeX,
+        maxStorageBuffersPerShaderStage: aLim.maxStorageBuffersPerShaderStage,
+    };
+    /* Opt into optional features where supported; gracefully fall back if not.
+       - subgroups: warp reductions for matmul
+       - shader-f16: native half-precision activations (halves activation BW) */
+    console.log('[WebGPU] adapter.features:', Array.from(adapter.features));
+    const hasSubgroups = adapter.features.has('subgroups');
+    const hasF16       = adapter.features.has('shader-f16');
+    const requiredFeatures = [];
+    if (hasSubgroups) requiredFeatures.push('subgroups');
+    if (hasF16)       requiredFeatures.push('shader-f16');
+    console.log('[WebGPU] features in use:',
+                'subgroups=' + (hasSubgroups ? 'on' : 'off'),
+                'shader-f16=' + (hasF16 ? 'on' : 'off (fallback to f32 activations)'));
+    const device = await adapter.requestDevice({ requiredLimits, requiredFeatures });
+    device.lost.then(info => console.error('GPU device lost:', info.reason, info.message));
+    device.onuncapturederror = (e) => {
+        console.error('WebGPU error:', e.error.message);
+        status(`<span class="err">GPU: ${e.error.message}</span>`, '');
+    };
+
+    /* Uniform ring buffer with dynamic offsets so each dispatch gets its own params slice. */
+    const uniformRing = device.createBuffer({
+        size: UNIFORM_SLOT * UNIFORM_SLOTS,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+
+    /* Pre-build pipelines keyed by name. Use async compilation and await all in parallel
+       so WGSL compile doesn't block the first forward pass. */
+    const pipelines = {};
+    const bindLayouts = {};
+    const pipePromises = [];
+    const mkLayout = (entries) => device.createBindGroupLayout({ entries });
+    /* Kernels are written in the f16 dialect; rewrite to f32 if the adapter
+       can't run them natively. */
+    const prepShader = hasF16 ? (w => w) : toF32Shader;
+    const mkPipe = (code, layout, label) => {
+        const module = device.createShaderModule({ code: prepShader(code), label });
+        const promise = device.createComputePipelineAsync({
+            layout: device.createPipelineLayout({ bindGroupLayouts: [layout] }),
+            compute: { module, entryPoint: 'main' },
+            label,
+        }).then(p => { pipelines[label] = p; return p; });
+        pipePromises.push(promise);
+        /* Return a placeholder so the caller's assignment to pipelines[...] works. */
+        return null;
+    };
+
+    /* Matmul layouts: W (read storage), X (read storage), Y (read_write storage), P (uniform, dyn) */
+    const mmLayout = mkLayout([
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+        { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform', hasDynamicOffset: true } },
+    ]);
+    bindLayouts.mm = mmLayout;
+
+    /* FFN gate+up fused kernel layout: 2 weight buffers + X + Y + P (dyn). */
+    const ffnLayout = mkLayout([
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+        { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform', hasDynamicOffset: true } },
+    ]);
+    bindLayouts.ffn = ffnLayout;
+    /* Inject the right reduction variant + enable subgroups when available.
+       FFN kernel already has its own `enable f16;` directive; prepShader
+       (which runs inside mkPipe) handles the f32 fallback by stripping it. */
+    const ffnRedG = hasSubgroups ? SG_REDUCE_ACC_G : TREE_REDUCE_ACC_G;
+    const ffnRedU = hasSubgroups ? SG_REDUCE_ACC_U : TREE_REDUCE_ACC_U;
+    const ffnEnables = hasSubgroups ? 'enable subgroups;\n' : '';
+    const ffnSrc = ffnEnables +
+        WGSL_MATMUL_Q4K_FFN
+            .replace('/*[REDUCE_ACC_G]*/', ffnRedG)
+            .replace('/*[REDUCE_ACC_U]*/', ffnRedU);
+    pipelines.ffn_gate_up_q4k = mkPipe(ffnSrc, ffnLayout, 'ffn_gate_up_q4k');
+
+    const mm = assembleMatmulKernels(hasSubgroups);
+    pipelines.mm_q4k   = mkPipe(mm.q4k,   mmLayout, 'mm_q4k');
+    pipelines.mm_q5k   = mkPipe(mm.q5k,   mmLayout, 'mm_q5k');
+    pipelines.mm_q6k   = mkPipe(mm.q6k,   mmLayout, 'mm_q6k');
+    pipelines.mm_iq4xs = mkPipe(mm.iq4xs, mmLayout, 'mm_iq4xs');
+    pipelines.mm_f16   = mkPipe(mm.f16,   mmLayout, 'mm_f16');
+    pipelines.mm_bf16  = mkPipe(mm.bf16,  mmLayout, 'mm_bf16');
+    pipelines.mm_f32   = mkPipe(mm.f32,   mmLayout, 'mm_f32');
+
+    /* RMSNorm out-of-place: Xin, Win, Out, P */
+    const rmsOpLayout = mkLayout([
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+        { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform', hasDynamicOffset: true } },
+    ]);
+    bindLayouts.rmsOp = rmsOpLayout;
+    pipelines.rmsnorm_op = mkPipe(WGSL_RMSNORM_OP, rmsOpLayout, 'rmsnorm_op');
+
+    /* RMSNorm in-place: X (rw), Win, P */
+    const rmsIpLayout = mkLayout([
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform', hasDynamicOffset: true } },
+    ]);
+    bindLayouts.rmsIp = rmsIpLayout;
+    pipelines.rmsnorm_ip = mkPipe(WGSL_RMSNORM_IP, rmsIpLayout, 'rmsnorm_ip');
+
+    /* RoPE: V (rw), FF (r), P */
+    const ropeLayout = mkLayout([
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform', hasDynamicOffset: true } },
+    ]);
+    bindLayouts.rope = ropeLayout;
+    pipelines.rope = mkPipe(WGSL_ROPE, ropeLayout, 'rope');
+    /* Cache-write fused variants — reuse the rmsOp bind group layout
+       (2 ro-storage, 1 rw-storage, 1 uniform dyn). */
+    pipelines.rope_to_cache    = mkPipe(WGSL_ROPE_TO_CACHE,    rmsOpLayout, 'rope_to_cache');
+    pipelines.rmsnorm_to_cache = mkPipe(WGSL_RMSNORM_TO_CACHE, rmsOpLayout, 'rmsnorm_to_cache');
+    /* x += rmsnorm(xb, W) fused residual kernel, same layout. */
+    pipelines.add_rmsnorm      = mkPipe(WGSL_ADD_RMSNORM,      rmsOpLayout, 'add_rmsnorm');
+
+    /* Softmax: V (rw), P */
+    const softLayout = mkLayout([
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform', hasDynamicOffset: true } },
+    ]);
+    bindLayouts.soft = softLayout;
+    pipelines.softmax = mkPipe(WGSL_SOFTMAX, softLayout, 'softmax');
+
+    /* Attention scores: Q, KC, SC, P (dyn) */
+    const attnLayout = mkLayout([
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+        { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform', hasDynamicOffset: true } },
+    ]);
+    bindLayouts.attn = attnLayout;
+    pipelines.attn_scores = mkPipe(WGSL_ATTN_SCORES, attnLayout, 'attn_scores');
+    pipelines.attn_value  = mkPipe(WGSL_ATTN_VALUE,  attnLayout, 'attn_value');
+
+    /* Flash Attention: 5 bindings (Q, KC, VC, OUT, P). Substitute the in-loop
+       score reduction with tree or subgroup variant. */
+    const faLayout = mkLayout([
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+        { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform', hasDynamicOffset: true } },
+    ]);
+    bindLayouts.fa = faLayout;
+    const faReduce = hasSubgroups ? SG_REDUCE_SCORE : TREE_REDUCE_SCORE;
+    const faEnables = hasSubgroups ? 'enable subgroups;\n' : '';
+    const faSrc = faEnables + WGSL_FLASH_ATTN.replace('/*[REDUCE_SCORE]*/', faReduce);
+    pipelines.flash_attn = mkPipe(faSrc, faLayout, 'flash_attn');
+
+    /* Elementwise 2-buf + params (A rw, B r, P) */
+    const e2Layout = mkLayout([
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform', hasDynamicOffset: true } },
+    ]);
+    bindLayouts.e2 = e2Layout;
+    pipelines.gelu_mul = mkPipe(WGSL_GELU_MUL, e2Layout, 'gelu_mul');
+    pipelines.add      = mkPipe(WGSL_ADD,      e2Layout, 'add');
+    pipelines.mul      = mkPipe(WGSL_MUL,      e2Layout, 'mul');
+    pipelines.add_scale = mkPipe(WGSL_ADD_SCALE, e2Layout, 'add_scale');
+
+    /* Elementwise 1-buf + params (A rw, P) */
+    const e1Layout = mkLayout([
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform', hasDynamicOffset: true } },
+    ]);
+    bindLayouts.e1 = e1Layout;
+    pipelines.gelu    = mkPipe(WGSL_GELU,    e1Layout, 'gelu');
+    pipelines.scale   = mkPipe(WGSL_SCALE,   e1Layout, 'scale');
+    pipelines.softcap = mkPipe(WGSL_SOFTCAP, e1Layout, 'softcap');
+
+    /* Slice copy (S r, D rw, P) */
+    const copyLayout = mkLayout([
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform', hasDynamicOffset: true } },
+    ]);
+    bindLayouts.copy = copyLayout;
+    pipelines.slice_copy = mkPipe(WGSL_SLICE_COPY, copyLayout, 'slice_copy');
+
+    /* Dummy f32 buffer for optional bindings (e.g. rmsnorm with no weight, rope with no freq factors). */
+    const dummyF32Buf = device.createBuffer({
+        size: 64,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    device.queue.writeBuffer(dummyF32Buf, 0, new Float32Array(16));
+
+    /* Block until all WGSL shaders are fully compiled — otherwise the first forward
+       pass triggers serial compilation of ~20 pipelines and takes 30+ seconds. */
+    await Promise.all(pipePromises);
+
+    const state = { adapter, device, pipelines, bindLayouts, uniformRing, ringOffset: 0,
+                    limits: device.limits, bgCache: new Map(), nextBufId: 1, dummyF32Buf,
+                    hasF16, hasSubgroups };
+    dummyF32Buf._id = state.nextBufId++;
+    return state;
+}
+
+/* Acquire next 256-byte slot in the uniform ring. Returns the byte offset. */
+function takeUniformSlot() {
+    const off = GPU.ringOffset;
+    GPU.ringOffset = (GPU.ringOffset + UNIFORM_SLOT);
+    if (GPU.ringOffset >= UNIFORM_SLOT * UNIFORM_SLOTS) GPU.ringOffset = 0;
+    return off;
+}
+
+/* Get or create a cached bind group for a given pipeline + buffer set. */
+function getBindGroup(layoutKey, layout, buffers, uniformSize) {
+    const key = layoutKey + '|' + buffers.map(b => '_id' in b ? b._id : '?').join(',');
+    let bg = GPU.bgCache.get(key);
+    if (bg) return bg;
+    const entries = buffers.map((b, i) => ({ binding: i, resource: { buffer: b } }));
+    entries.push({
+        binding: buffers.length,
+        resource: { buffer: GPU.uniformRing, offset: 0, size: uniformSize },
+    });
+    bg = GPU.device.createBindGroup({ layout, entries });
+    GPU.bgCache.set(key, bg);
+    return bg;
+}
+
+/* Tag a GPUBuffer with a stable id for bind-group caching. */
+function tagBuf(buf) { buf._id = GPU.nextBufId++; return buf; }
+
+/* Write u32 params to the next ring slot and return the slot offset.
+   Floats must be passed as their u32 bit pattern via f32bits(). */
+const _paramsScratch = new Uint32Array(UNIFORM_SLOT / 4);
+function writeParams(...vals) {
+    const off = takeUniformSlot();
+    for (let i = 0; i < vals.length; i++) _paramsScratch[i] = vals[i] >>> 0;
+    /* writeBuffer size must be a multiple of 4 and at most the scratch length. */
+    const size = Math.max(16, ((vals.length * 4) + 3) & ~3);
+    GPU.device.queue.writeBuffer(GPU.uniformRing, off, _paramsScratch.buffer, 0, size);
+    return off;
+}
+
+const _f32bitsBuf = new ArrayBuffer(4);
+const _f32bitsF = new Float32Array(_f32bitsBuf);
+const _f32bitsU = new Uint32Array(_f32bitsBuf);
+function f32bits(x) { _f32bitsF[0] = x; return _f32bitsU[0]; }
+
+/* ================================================================
+   SECTION 8: Dispatch helpers (one function per kernel family)
+   ================================================================ */
+
+function encMatmul(pass, wt, xBuf, yBuf, nOut, nIn, softcap) {
+    const pipe = GPU.pipelines[matmulPipeKey(wt.type)];
+    const rb = wt.rb;
+    const bg = getBindGroup('mm|' + wt.type, GPU.bindLayouts.mm, [wt.gpu, xBuf, yBuf], UNIFORM_SLOT);
+    const maxPerDim = GPU.limits.maxComputeWorkgroupsPerDimension;
+    const scBits = softcap ? f32bits(softcap) : 0;
+    /* Each workgroup produces M_ROWS output rows. Batch if the required
+       workgroup count exceeds the per-dimension dispatch limit. */
+    const totalWGs = Math.ceil(nOut / M_ROWS);
+    pass.setPipeline(pipe);
+    let wgsDone = 0;
+    while (wgsDone < totalWGs) {
+        const batch = Math.min(maxPerDim, totalWGs - wgsDone);
+        const rowBase = wgsDone * M_ROWS;
+        const off = writeParams(nIn, nOut, rb, rowBase, scBits, 0);
+        pass.setBindGroup(0, bg, [off]);
+        pass.dispatchWorkgroups(batch, 1, 1);
+        wgsDone += batch;
+    }
+}
+
+/* Fused FFN gate+up: Y[row] = gelu(gate·X) * (up·X). Only supports Q4_K weights
+   (which is what all Q4_K_XL Gemma 4 FFN tensors use). Falls back to separate
+   matmuls + gelu_mul if either tensor is not Q4_K. */
+function encFFNGateUp(pass, wtGate, wtUp, xBuf, yBuf, nOut, nIn) {
+    if (wtGate.type !== GGML.Q4_K || wtUp.type !== GGML.Q4_K) return false;
+    const pipe = GPU.pipelines.ffn_gate_up_q4k;
+    const rb = wtGate.rb;  // gate and up have identical shape so identical row_bytes
+    const bg = getBindGroup('ffn|q4k',
+        GPU.bindLayouts.ffn,
+        [wtGate.gpu, wtUp.gpu, xBuf, yBuf],
+        UNIFORM_SLOT);
+    const maxPerDim = GPU.limits.maxComputeWorkgroupsPerDimension;
+    const totalWGs = Math.ceil(nOut / M_ROWS);
+    pass.setPipeline(pipe);
+    let wgsDone = 0;
+    while (wgsDone < totalWGs) {
+        const batch = Math.min(maxPerDim, totalWGs - wgsDone);
+        const off = writeParams(nIn, nOut, rb, wgsDone * M_ROWS);
+        pass.setBindGroup(0, bg, [off]);
+        pass.dispatchWorkgroups(batch, 1, 1);
+        wgsDone += batch;
+    }
+    return true;
+}
+
+function matmulPipeKey(type) {
+    switch (type) {
+        case GGML.Q4_K:  return 'mm_q4k';
+        case GGML.Q5_K:  return 'mm_q5k';
+        case GGML.Q6_K:  return 'mm_q6k';
+        case GGML.IQ4_XS: return 'mm_iq4xs';
+        case GGML.F16:   return 'mm_f16';
+        case GGML.BF16:  return 'mm_bf16';
+        case GGML.F32:   return 'mm_f32';
+        default: throw new Error('No GPU matmul for type ' + type);
+    }
+}
+
+function encRmsnorm(pass, xBuf, wBuf, outBuf, nRows, n, eps, mode) {
+    /* mode: 0 with weight, 1 without weight.
+       Picks in-place or out-of-place variant based on whether xBuf===outBuf. */
+    const wEff = wBuf || GPU.dummyF32Buf;
+    const off = writeParams(n, f32bits(eps), mode, 0);
+    if (xBuf === outBuf) {
+        const bg = getBindGroup('rmsIp', GPU.bindLayouts.rmsIp, [xBuf, wEff], UNIFORM_SLOT);
+        pass.setPipeline(GPU.pipelines.rmsnorm_ip);
+        pass.setBindGroup(0, bg, [off]);
+    } else {
+        const bg = getBindGroup('rmsOp', GPU.bindLayouts.rmsOp, [xBuf, wEff, outBuf], UNIFORM_SLOT);
+        pass.setPipeline(GPU.pipelines.rmsnorm_op);
+        pass.setBindGroup(0, bg, [off]);
+    }
+    pass.dispatchWorkgroups(nRows, 1, 1);
+}
+
+function encRope(pass, vBuf, ffBuf, nGroups, headDim, nRot, pos, useFF, theta) {
+    const off = writeParams(headDim, nRot, pos, useFF ? 1 : 0, f32bits(theta), 0, 0, 0);
+    const bg = getBindGroup('rope', GPU.bindLayouts.rope, [vBuf, ffBuf], UNIFORM_SLOT);
+    pass.setPipeline(GPU.pipelines.rope);
+    pass.setBindGroup(0, bg, [off]);
+    pass.dispatchWorkgroups(nGroups, 1, 1);
+}
+
+/* Fused rope + cache-slice write (for K). cacheOffset is in elements. */
+function encRopeToCache(pass, srcBuf, ffBuf, dstBuf, nGroups, headDim, nRot, pos, useFF, theta, cacheOffset) {
+    const off = writeParams(headDim, nRot, pos, useFF ? 1 : 0, f32bits(theta), cacheOffset >>> 0, 0, 0);
+    const bg = getBindGroup('rope_tc', GPU.bindLayouts.rmsOp, [srcBuf, ffBuf, dstBuf], UNIFORM_SLOT);
+    pass.setPipeline(GPU.pipelines.rope_to_cache);
+    pass.setBindGroup(0, bg, [off]);
+    pass.dispatchWorkgroups(nGroups, 1, 1);
+}
+
+/* Fused no-weight rmsnorm + cache-slice write (for V). */
+function encRmsnormToCache(pass, srcBuf, dstBuf, nGroups, n, eps, cacheOffset) {
+    const off = writeParams(n, f32bits(eps), cacheOffset >>> 0, 0);
+    const bg = getBindGroup('rms_tc', GPU.bindLayouts.rmsOp, [srcBuf, GPU.dummyF32Buf, dstBuf], UNIFORM_SLOT);
+    pass.setPipeline(GPU.pipelines.rmsnorm_to_cache);
+    pass.setBindGroup(0, bg, [off]);
+    pass.dispatchWorkgroups(nGroups, 1, 1);
+}
+
+/* Fused: A += rmsnorm(B, W). Replaces the rmsnorm(B→B) + add(A,B) pair. */
+function encAddRmsnorm(pass, xBuf /* A */, xbBuf /* B */, wBuf, nRows, n, eps) {
+    const off = writeParams(n, f32bits(eps), 0, 0);
+    const bg = getBindGroup('add_rms', GPU.bindLayouts.rmsOp, [xbBuf, wBuf, xBuf], UNIFORM_SLOT);
+    pass.setPipeline(GPU.pipelines.add_rmsnorm);
+    pass.setBindGroup(0, bg, [off]);
+    pass.dispatchWorkgroups(nRows, 1, 1);
+}
+
+function encSoftmax(pass, vBuf, stride, len, nRows) {
+    const off = writeParams(stride, len);
+    const bg = getBindGroup('soft', GPU.bindLayouts.soft, [vBuf], UNIFORM_SLOT);
+    pass.setPipeline(GPU.pipelines.softmax);
+    pass.setBindGroup(0, bg, [off]);
+    pass.dispatchWorkgroups(nRows, 1, 1);
+}
+
+function encAttnScores(pass, qBuf, kcBuf, scBuf, params) {
+    const { nh, hd, srcHd, srcNkv, kvStart, kvLen, srcSwa, slidingWindow, stride, dd } = params;
+    const off = writeParams(nh, hd, srcHd, srcNkv, kvStart, kvLen, srcSwa ? 1 : 0, slidingWindow, stride, dd, 0, 0);
+    const bg = getBindGroup('attn_s', GPU.bindLayouts.attn, [qBuf, kcBuf, scBuf], UNIFORM_SLOT);
+    pass.setPipeline(GPU.pipelines.attn_scores);
+    pass.setBindGroup(0, bg, [off]);
+    pass.dispatchWorkgroups(nh, kvLen, 1);
+}
+
+function encAttnValue(pass, scBuf, vcBuf, outBuf, params) {
+    const { nh, hd, srcHd, srcNkv, kvStart, kvLen, srcSwa, slidingWindow, stride, vd } = params;
+    const off = writeParams(nh, hd, srcHd, srcNkv, kvStart, kvLen, srcSwa ? 1 : 0, slidingWindow, stride, vd, 0, 0);
+    const bg = getBindGroup('attn_v', GPU.bindLayouts.attn, [scBuf, vcBuf, outBuf], UNIFORM_SLOT);
+    pass.setPipeline(GPU.pipelines.attn_value);
+    pass.setBindGroup(0, bg, [off]);
+    pass.dispatchWorkgroups(nh, 1, 1);
+}
+
+/* Flash attention: one dispatch replaces attn_scores + softmax + attn_value.
+   One workgroup per head; streams K+V through a single loop with online softmax. */
+function encFlashAttn(pass, qBuf, kcBuf, vcBuf, outBuf, params) {
+    const { nh, hd, srcHd, srcNkv, kvStart, kvLen, srcSwa, slidingWindow } = params;
+    const off = writeParams(nh, hd, srcHd, srcNkv, kvStart, kvLen, srcSwa ? 1 : 0, slidingWindow);
+    const bg = getBindGroup('fa', GPU.bindLayouts.fa, [qBuf, kcBuf, vcBuf, outBuf], UNIFORM_SLOT);
+    pass.setPipeline(GPU.pipelines.flash_attn);
+    pass.setBindGroup(0, bg, [off]);
+    pass.dispatchWorkgroups(nh, 1, 1);
+}
+
+function encElem2(pass, pipeName, aBuf, bBuf, n, extraArg) {
+    const off = extraArg !== undefined ? writeParams(n, f32bits(extraArg)) : writeParams(n, 0);
+    const bg = getBindGroup('e2|' + pipeName, GPU.bindLayouts.e2, [aBuf, bBuf], UNIFORM_SLOT);
+    pass.setPipeline(GPU.pipelines[pipeName]);
+    pass.setBindGroup(0, bg, [off]);
+    pass.dispatchWorkgroups(Math.ceil(n / WG_ELEM), 1, 1);
+}
+
+function encElem1(pass, pipeName, aBuf, n, extraArg) {
+    const off = extraArg !== undefined ? writeParams(n, f32bits(extraArg)) : writeParams(n, 0);
+    const bg = getBindGroup('e1|' + pipeName, GPU.bindLayouts.e1, [aBuf], UNIFORM_SLOT);
+    pass.setPipeline(GPU.pipelines[pipeName]);
+    pass.setBindGroup(0, bg, [off]);
+    pass.dispatchWorkgroups(Math.ceil(n / WG_ELEM), 1, 1);
+}
+
+function encSliceCopy(pass, sBuf, dBuf, n, srcOff, dstOff) {
+    const off = writeParams(n, srcOff, dstOff, 0);
+    const bg = getBindGroup('copy', GPU.bindLayouts.copy, [sBuf, dBuf], UNIFORM_SLOT);
+    pass.setPipeline(GPU.pipelines.slice_copy);
+    pass.setBindGroup(0, bg, [off]);
+    pass.dispatchWorkgroups(Math.ceil(n / WG_ELEM), 1, 1);
+}
+
+/* ================================================================
+   SECTION 9: Model loading — all weights streamed to GPU buffers
+   ================================================================ */
+
+/* Upload a tensor's raw bytes to a dedicated GPUBuffer (STORAGE|COPY_DST).
+   Returns { gpu, type, rb, nIn, nOut }. Frees the CPU bytes afterwards. */
+async function uploadTensor(file, gguf, name, required) {
+    const t = gguf.tensors[name];
+    if (!t) {
+        if (required) throw new Error('Required tensor missing: ' + name);
+        return null;
+    }
+    const nIn = t.dims[0] || 1;
+    const nOut = t.nDims > 1 ? t.dims[1] : 1;
+    const rb = rowBytes(nIn, t.type);
+    const totalBytes = nOut * rb;
+
+    /* GPUBuffer sizes must be a multiple of 4. Pad the last write up. */
+    const roundedSize = (totalBytes + 3) & ~3;
+    const buf = GPU.device.createBuffer({
+        size: roundedSize,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        label: name,
+    });
+
+    /* Stream the file bytes in chunks to avoid holding a 2GB Uint8Array. */
+    const CHUNK = 16 * 1024 * 1024;
+    let off = 0;
+    while (off < totalBytes) {
+        const len = Math.min(CHUNK, totalBytes - off);
+        const ab = await file.slice(gguf.dataStart + t.offset + off,
+                                     gguf.dataStart + t.offset + off + len).arrayBuffer();
+        /* writeBuffer requires (size % 4 == 0) and (offset % 4 == 0). Pad tail if needed. */
+        let u8 = new Uint8Array(ab);
+        if (u8.byteLength % 4 !== 0) {
+            const padded = new Uint8Array((u8.byteLength + 3) & ~3);
+            padded.set(u8);
+            u8 = padded;
+        }
+        GPU.device.queue.writeBuffer(buf, off, u8);
+        off += len;
+    }
+    tagBuf(buf);
+    return { gpu: buf, type: t.type, rb, nIn, nOut, totalBytes };
+}
+
+/* Read a small tensor and dequantize to f32 on CPU, then upload. */
+async function uploadSmallAsF32(file, gguf, name, n) {
+    const t = gguf.tensors[name];
+    if (!t) return null;
+    const nIn = t.dims[0] || 1;
+    const rb = rowBytes(nIn, t.type);
+    const size = (t.nDims > 1 ? t.dims[1] : 1) * rb;
+    const ab = await file.slice(gguf.dataStart + t.offset,
+                                 gguf.dataStart + t.offset + size).arrayBuffer();
+    const src = new Uint8Array(ab);
+    const f = new Float32Array(n);
+    dequantRow(src, 0, f, n, t.type);
+    const buf = GPU.device.createBuffer({
+        size: n * 4,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        label: name,
+    });
+    GPU.device.queue.writeBuffer(buf, 0, f);
+    tagBuf(buf);
+    return buf;
+}
+
+/* Read a small f32 scalar/array verbatim. */
+async function readSmallF32(file, gguf, name, n) {
+    const t = gguf.tensors[name];
+    if (!t) return null;
+    const ab = await file.slice(gguf.dataStart + t.offset,
+                                 gguf.dataStart + t.offset + n * 4).arrayBuffer();
+    return new Float32Array(ab);
+}
+
+/* Create an uninitialized f32 activation buffer (STORAGE | COPY_SRC | COPY_DST). */
+/* Activation element size: 2 bytes (f16) when shader-f16 is available, else 4 (f32).
+   Buffer byte-count must be a multiple of 4 per WebGPU, so we round up. */
+function actBytesPerElem() { return GPU.hasF16 ? 2 : 4; }
+
+function mkActivationBuf(nElems, label) {
+    const bpe = actBytesPerElem();
+    const size = Math.max(16, (nElems * bpe + 3) & ~3);
+    const b = GPU.device.createBuffer({
+        size,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+        label,
+    });
+    return tagBuf(b);
+}
+
+/* Used only for attention scores, which stay in f32 for softmax range. */
+function mkF32ActivationBuf(nElems, label) {
+    const size = Math.max(16, nElems * 4);
+    const b = GPU.device.createBuffer({
+        size,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+        label,
+    });
+    return tagBuf(b);
+}
+
+/* A 1-element f32 "no-op" buffer used as a stand-in for optional bindings. */
+function mkDummyBuf() {
+    const b = GPU.device.createBuffer({
+        size: 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    GPU.device.queue.writeBuffer(b, 0, new Float32Array([0, 0, 0, 0]));
+    return tagBuf(b);
+}
+
+async function loadModel(file, gguf, statusFn) {
+    const meta = gguf.meta;
+    const m = { file };
+
+    m.nLayer  = meta['gemma4.block_count'];
+    m.nEmbd   = meta['gemma4.embedding_length'];
+    m.nHead   = meta['gemma4.attention.head_count'];
+    m.nKvHeadSwa = meta['gemma4.attention.head_count_kv'];
+    m.nVocab  = meta['tokenizer.ggml.tokens'].length;
+    m.headDimSwa  = meta['gemma4.attention.key_length_swa'] || 256;
+    m.headDimFull = meta['gemma4.attention.key_length'] || 512;
+    m.slidingWindow = meta['gemma4.attention.sliding_window'] || 512;
+    m.nKvShared = meta['gemma4.attention.shared_kv_layers'] || 0;
+    m.nEmbdPerLayer = meta['gemma4.embedding_length_per_layer_input'] || 0;
+    m.rmsEps  = meta['gemma4.attention.layer_norm_rms_epsilon'] || 1e-6;
+    m.softcap = meta['gemma4.final_logit_softcapping'] !== undefined ? meta['gemma4.final_logit_softcapping'] : 30.0;
+    m.ropeThetaFull = meta['gemma4.rope.freq_base'] || 1000000;
+    m.ropeThetaSwa  = meta['gemma4.rope.freq_base_swa'] || 10000;
+    m.nKvHeadFull = m.nKvHeadSwa;
+
+    const nLayerKv = m.nLayer - m.nKvShared;
+    m.nLayerKv = nLayerKv;
+
+    const swaPattern = meta['gemma4.attention.sliding_window_pattern'] || [];
+    const ffnSizes = meta['gemma4.feed_forward_length'] || [];
+    m.swaPattern = [];
+    m.nFF = [];
+    for (let il = 0; il < m.nLayer; il++) {
+        m.swaPattern[il] = swaPattern[il] || false;
+        m.nFF[il] = ffnSizes[il] || 0;
+    }
+    m.kvSource = [];
+    for (let il = 0; il < m.nLayer; il++) {
+        if (il < nLayerKv) m.kvSource[il] = il;
+        else if (m.swaPattern[il]) m.kvSource[il] = nLayerKv - 2;
+        else m.kvSource[il] = nLayerKv - 1;
+    }
+
+    statusFn('Loading tokenizer...');
+    m.tok = new Tokenizer(meta);
+
+    statusFn('Uploading token embedding & norms...');
+    m.tokenEmbdT = await uploadTensor(file, gguf, 'token_embd.weight', true);
+    /* Also keep a CPU-side cache of the bytes so per-token row lookups don't
+       hit file.slice() async IPC (~2-5ms saved per token). */
+    m.tokenEmbdCache = await cacheTensorBytes(file, gguf, 'token_embd.weight', statusFn);
+    m.outputNorm = await uploadSmallAsF32(file, gguf, 'output_norm.weight', m.nEmbd);
+    const ropeFreqs = await readSmallF32(file, gguf, 'rope_freqs.weight',
+        gguf.tensors['rope_freqs.weight'] ? gguf.tensors['rope_freqs.weight'].dims[0] : 0);
+    if (ropeFreqs) {
+        m.ropeFreqsBuf = GPU.device.createBuffer({
+            size: ropeFreqs.byteLength,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST, label: 'rope_freqs',
+        });
+        GPU.device.queue.writeBuffer(m.ropeFreqsBuf, 0, ropeFreqs);
+        tagBuf(m.ropeFreqsBuf);
+        m.hasRopeFreqs = true;
+    } else {
+        m.ropeFreqsBuf = mkDummyBuf();
+        m.hasRopeFreqs = false;
+    }
+
+    if (m.nEmbdPerLayer > 0) {
+        statusFn('Uploading PLE tensors...');
+        m.pleModelProjT = await uploadTensor(file, gguf, 'per_layer_model_proj.weight', true);
+        m.pleProjNormBuf = await uploadSmallAsF32(file, gguf, 'per_layer_proj_norm.weight', m.nEmbdPerLayer);
+        /* PLE token embedding is only used for row lookup — cache in CPU RAM
+           (costs ~1GB but avoids async file.slice per token). */
+        m.pleTokenEmbdCache = await cacheTensorBytes(file, gguf, 'per_layer_token_embd.weight', statusFn);
+    }
+
+    m.layers = [];
+    for (let il = 0; il < m.nLayer; il++) {
+        statusFn(`Uploading layer ${il+1}/${m.nLayer}...`);
+        const L = {};
+        const isSwa = m.swaPattern[il];
+        L.isSwa = isSwa;
+        L.hasKv = il < nLayerKv;
+        L.headDim = isSwa ? m.headDimSwa : m.headDimFull;
+        L.nKvHead = isSwa ? m.nKvHeadSwa : m.nKvHeadFull;
+        L.nFF = m.nFF[il];
+
+        const p = (s) => `blk.${il}.${s}`;
+
+        L.attnNormBuf    = await uploadSmallAsF32(file, gguf, p('attn_norm.weight'), m.nEmbd);
+        L.postAttnNormBuf= await uploadSmallAsF32(file, gguf, p('post_attention_norm.weight'), m.nEmbd);
+        L.ffnNormBuf     = await uploadSmallAsF32(file, gguf, p('ffn_norm.weight'), m.nEmbd);
+        L.postFfnNormBuf = await uploadSmallAsF32(file, gguf, p('post_ffw_norm.weight'), m.nEmbd);
+        L.attnQNormBuf   = await uploadSmallAsF32(file, gguf, p('attn_q_norm.weight'), L.headDim);
+        L.attnKNormBuf   = await uploadSmallAsF32(file, gguf, p('attn_k_norm.weight'), L.headDim);
+
+        L.attnQT   = await uploadTensor(file, gguf, p('attn_q.weight'), true);
+        L.attnKT   = await uploadTensor(file, gguf, p('attn_k.weight'), false);
+        L.attnVT   = await uploadTensor(file, gguf, p('attn_v.weight'), false);
+        L.attnOutT = await uploadTensor(file, gguf, p('attn_output.weight'), true);
+        L.ffnGateT = await uploadTensor(file, gguf, p('ffn_gate.weight'), true);
+        L.ffnUpT   = await uploadTensor(file, gguf, p('ffn_up.weight'), true);
+        L.ffnDownT = await uploadTensor(file, gguf, p('ffn_down.weight'), true);
+
+        if (m.nEmbdPerLayer > 0) {
+            L.pleInpGateT = await uploadTensor(file, gguf, p('inp_gate.weight'), true);
+            L.pleProjT    = await uploadTensor(file, gguf, p('proj.weight'), true);
+            L.plePostNormBuf = await uploadSmallAsF32(file, gguf, p('post_norm.weight'), m.nEmbd);
+        }
+
+        const lst = gguf.tensors[`blk.${il}.layer_output_scale.weight`];
+        if (lst) {
+            const sb = await file.slice(gguf.dataStart + lst.offset, gguf.dataStart + lst.offset + 4).arrayBuffer();
+            L.layerScale = new Float32Array(sb)[0];
+        } else {
+            L.layerScale = 1.0;
+        }
+        m.layers[il] = L;
+    }
+    return m;
+}
+
+function initState(m, maxCtx) {
+    const ne = m.nEmbd;
+    const maxHd = Math.max(m.headDimFull, m.headDimSwa);
+    let maxFF = 0;
+    for (let il = 0; il < m.nLayer; il++) if (m.nFF[il] > maxFF) maxFF = m.nFF[il];
+
+    const s = { maxCtx };
+    s.x      = mkActivationBuf(ne, 'x');
+    s.xb     = mkActivationBuf(ne, 'xb');
+    s.xb2    = mkActivationBuf(Math.max(ne, m.nHead * maxHd), 'xb2');
+    s.qBuf   = mkActivationBuf(m.nHead * maxHd, 'qBuf');
+    s.kBuf   = mkActivationBuf(m.nKvHeadSwa * maxHd, 'kBuf');
+    s.vBuf   = mkActivationBuf(m.nKvHeadSwa * maxHd, 'vBuf');
+    s.att    = mkF32ActivationBuf(m.nHead * maxCtx, 'att');
+    s.hb     = mkActivationBuf(maxFF, 'hb');
+    s.hb2    = mkActivationBuf(maxFF, 'hb2');
+    s.logits = mkActivationBuf(m.nVocab, 'logits');
+
+    if (m.nEmbdPerLayer > 0) {
+        const total = m.nEmbdPerLayer * m.nLayer;
+        s.pleBuf     = mkActivationBuf(total, 'pleBuf');
+        s.pleProjBuf = mkActivationBuf(total, 'pleProjBuf');
+        s.pleTmp     = mkActivationBuf(m.nEmbdPerLayer, 'pleTmp');
+    }
+
+    /* KV caches */
+    s.kvK = []; s.kvV = []; s.kvMaxLen = [];
+    for (let il = 0; il < m.nLayerKv; il++) {
+        const L = m.layers[il];
+        const kvLen = L.isSwa ? m.slidingWindow : maxCtx;
+        const kvDim = L.nKvHead * L.headDim;
+        s.kvK[il] = mkActivationBuf(kvLen * kvDim, `kvK_${il}`);
+        s.kvV[il] = mkActivationBuf(kvLen * kvDim, `kvV_${il}`);
+        s.kvMaxLen[il] = kvLen;
+    }
+
+    /* Staging buffer for logits readback. Size matches the active activation width. */
+    const lb = (m.nVocab * actBytesPerElem() + 3) & ~3;
+    s.logitsStaging = GPU.device.createBuffer({
+        size: lb,
+        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+    });
+    s.logitsBytes = lb;
+
+    return s;
+}
+
+/* ================================================================
+   SECTION 10: Embedding lookup (CPU-side, one row) → GPU x buffer
+   Each token requires exactly one row of the embedding matrix. We
+   dequant that row on CPU (small, ~2KB) and writeBuffer to x.
+   ================================================================ */
+
+/* Read a full embedding tensor into a CPU-side Uint8Array so that per-token row
+   lookup becomes a synchronous slice. file.slice().arrayBuffer() per token
+   costs ~2-5ms each through browser IPC; caching eliminates that entirely. */
+async function cacheTensorBytes(file, gguf, tensorName, statusFn) {
+    const t = gguf.tensors[tensorName];
+    if (!t) return null;
+    const nIn = t.dims[0] || 1;
+    const rb = rowBytes(nIn, t.type);
+    const size = (t.nDims > 1 ? t.dims[1] : 1) * rb;
+    if (statusFn) statusFn(`Caching ${tensorName} (${(size/1e6).toFixed(0)} MB)...`);
+    const ab = await file.slice(gguf.dataStart + t.offset,
+                                 gguf.dataStart + t.offset + size).arrayBuffer();
+    return { bytes: new Uint8Array(ab), rb, nIn, type: t.type };
+}
+
+/* Synchronous one-row dequant from a cached tensor. */
+function loadEmbedRowCached(cache, token, dst) {
+    dequantRow(cache.bytes, token * cache.rb, dst, cache.nIn, cache.type);
+}
+
+/* ================================================================
+   SECTION 11: Forward pass — all ops encoded into one command buffer.
+   Only readback: logits (n_vocab f32s) at the end.
+   ================================================================ */
+
+/* Rolling per-phase timing so we can see where each forward's wall time goes.
+   encode = forward start→submit; gpu = submit→mapAsync; sample = sampleToken;
+   dom = output + status + yield. outer = sum of these per step. */
+const TIMINGS = { encode: 0, gpu: 0, sample: 0, dom: 0, count: 0 };
+function resetTimings() { for (const k in TIMINGS) TIMINGS[k] = 0; }
+
+async function forward(m, gguf, st, token, pos) {
+    const ne = m.nEmbd;
+    const nh = m.nHead;
+    const eps = m.rmsEps;
+    const _t0 = performance.now();
+
+    /* --- 1. Token embedding lookup: CPU dequant one row, scale, write to x.
+       When hasF16 is on we pack into Uint16 halves; otherwise write Float32 directly. */
+    if (!st._embdRow) st._embdRow = new Float32Array(ne);
+    loadEmbedRowCached(m.tokenEmbdCache, token, st._embdRow);
+    const embdScale = Math.sqrt(ne);
+    if (GPU.hasF16) {
+        if (!st._embdRowU16) st._embdRowU16 = new Uint16Array((ne + 1) & ~1);
+        packF16Array(st._embdRow, st._embdRowU16, ne, embdScale);
+        GPU.device.queue.writeBuffer(st.x, 0, st._embdRowU16.buffer, 0, (ne * 2 + 3) & ~3);
+    } else {
+        for (let i = 0; i < ne; i++) st._embdRow[i] *= embdScale;
+        GPU.device.queue.writeBuffer(st.x, 0, st._embdRow);
+    }
+
+    /* --- 2. PLE token embedding lookup + proj --- */
+    if (m.nEmbdPerLayer > 0) {
+        const npl = m.nEmbdPerLayer;
+        const total = npl * m.nLayer;
+        if (!st._pleRow) st._pleRow = new Float32Array(total);
+        loadEmbedRowCached(m.pleTokenEmbdCache, token, st._pleRow);
+        const tokScale = Math.sqrt(npl);
+        if (GPU.hasF16) {
+            if (!st._pleRowU16) st._pleRowU16 = new Uint16Array((total + 1) & ~1);
+            packF16Array(st._pleRow, st._pleRowU16, total, tokScale);
+            GPU.device.queue.writeBuffer(st.pleBuf, 0, st._pleRowU16.buffer, 0, (total * 2 + 3) & ~3);
+        } else {
+            for (let i = 0; i < total; i++) st._pleRow[i] *= tokScale;
+            GPU.device.queue.writeBuffer(st.pleBuf, 0, st._pleRow);
+        }
+    }
+
+    GPU.ringOffset = 0;  /* reset uniform ring for this forward */
+
+    const enc = GPU.device.createCommandEncoder({ label: `forward_pos${pos}` });
+    const pass = enc.beginComputePass();
+
+    /* --- PLE projection path (GPU) --- */
+    if (m.nEmbdPerLayer > 0) {
+        const npl = m.nEmbdPerLayer;
+        const total = npl * m.nLayer;
+        encMatmul(pass, m.pleModelProjT, st.x, st.pleProjBuf, total, ne);
+        encElem1(pass, 'scale', st.pleProjBuf, total, 1.0 / Math.sqrt(ne));
+        /* Per-layer RMSNorm groups: n_layer rows of npl elements */
+        encRmsnorm(pass, st.pleProjBuf, m.pleProjNormBuf, st.pleProjBuf, m.nLayer, npl, eps, 0);
+        /* Combine: pleBuf[i] = (pleBuf[i] + pleProjBuf[i]) * (1/sqrt(2)) */
+        encElem2(pass, 'add_scale', st.pleBuf, st.pleProjBuf, total, 1.0 / Math.sqrt(2));
+    }
+
+    /* --- Layer loop --- */
+    for (let il = 0; il < m.nLayer; il++) {
+        const L = m.layers[il];
+        const hd = L.headDim;
+        const nKv = L.nKvHead;
+        const kvSrc = m.kvSource[il];
+        const theta = L.isSwa ? m.ropeThetaSwa : m.ropeThetaFull;
+        const nRot = L.isSwa ? m.headDimSwa : (m.headDimFull >>> 2);
+        const useFF = !L.isSwa && m.hasRopeFreqs;
+
+        /* Attention pre-norm */
+        encRmsnorm(pass, st.x, L.attnNormBuf, st.xb, 1, ne, eps, 0);
+
+        /* Q = Wq * xb, then q_norm + rope per head */
+        encMatmul(pass, L.attnQT, st.xb, st.qBuf, nh * hd, ne);
+        encRmsnorm(pass, st.qBuf, L.attnQNormBuf, st.qBuf, nh, hd, eps, 0);
+        encRope(pass, st.qBuf, m.ropeFreqsBuf, nh, hd, nRot, pos, useFF, theta);
+
+        /* K,V (skipped when hasKv=false; KV shared from another layer) */
+        if (L.hasKv && L.attnKT && L.attnVT) {
+            const cacheIdx = L.isSwa ? (pos % m.slidingWindow) : pos;
+            const kvDim = nKv * hd;
+            const cacheOffElems = cacheIdx * kvDim;
+
+            /* K path: matmul → rmsnorm → (rope + cache write fused). */
+            encMatmul(pass, L.attnKT, st.xb, st.kBuf, nKv * hd, ne);
+            encRmsnorm(pass, st.kBuf, L.attnKNormBuf, st.kBuf, nKv, hd, eps, 0);
+            encRopeToCache(pass, st.kBuf, m.ropeFreqsBuf, st.kvK[il],
+                           nKv, hd, nRot, pos, useFF, theta, cacheOffElems);
+
+            /* V path: matmul → (rmsnorm_no_weight + cache write fused). */
+            encMatmul(pass, L.attnVT, st.xb, st.vBuf, nKv * hd, ne);
+            encRmsnormToCache(pass, st.vBuf, st.kvV[il], nKv, hd, eps, cacheOffElems);
+        }
+
+        /* Attention over KV source layer */
+        const srcL = m.layers[kvSrc];
+        const srcHd = srcL.headDim, srcNKv = srcL.nKvHead, srcSwa = srcL.isSwa;
+        let kvStart, kvLen;
+        if (L.isSwa) {
+            kvStart = pos >= m.slidingWindow ? pos - m.slidingWindow + 1 : 0;
+            kvLen = pos - kvStart + 1;
+        } else {
+            kvStart = 0;
+            kvLen = pos + 1;
+        }
+        /* Fused flash attention: one dispatch with online softmax replaces
+           scores + softmax + attn·V. Saves 2 dispatches per layer and
+           eliminates the scores buffer roundtrip. */
+        encFlashAttn(pass, st.qBuf, st.kvK[kvSrc], st.kvV[kvSrc], st.xb2, {
+            nh, hd, srcHd, srcNkv: srcNKv, kvStart, kvLen,
+            srcSwa, slidingWindow: m.slidingWindow,
+        });
+
+        /* Output projection + post-norm + residual */
+        encMatmul(pass, L.attnOutT, st.xb2, st.xb, ne, nh * hd);
+        /* x += rmsnorm(xb, postAttnNorm) — fused. */
+        encAddRmsnorm(pass, st.x, st.xb, L.postAttnNormBuf, 1, ne, eps);
+
+        /* FFN */
+        encRmsnorm(pass, st.x, L.ffnNormBuf, st.xb, 1, ne, eps, 0);
+        if (!encFFNGateUp(pass, L.ffnGateT, L.ffnUpT, st.xb, st.hb, L.nFF, ne)) {
+            /* Fallback: separate matmuls + elementwise gelu_mul. */
+            encMatmul(pass, L.ffnGateT, st.xb, st.hb, L.nFF, ne);
+            encMatmul(pass, L.ffnUpT,   st.xb, st.hb2, L.nFF, ne);
+            encElem2(pass, 'gelu_mul', st.hb, st.hb2, L.nFF);
+        }
+        encMatmul(pass, L.ffnDownT, st.hb, st.xb, ne, L.nFF);
+        encAddRmsnorm(pass, st.x, st.xb, L.postFfnNormBuf, 1, ne, eps);
+
+        /* PLE injection */
+        if (m.nEmbdPerLayer > 0) {
+            const npl = m.nEmbdPerLayer;
+            encMatmul(pass, L.pleInpGateT, st.x, st.pleTmp, npl, ne);
+            encElem1(pass, 'gelu', st.pleTmp, npl);
+            encSliceCopy(pass, st.pleBuf, st.xb2, npl, il * npl, 0); /* reuse xb2 as temp */
+            encElem2(pass, 'mul', st.pleTmp, st.xb2, npl);
+            encMatmul(pass, L.pleProjT, st.pleTmp, st.xb, ne, npl);
+            encAddRmsnorm(pass, st.x, st.xb, L.plePostNormBuf, 1, ne, eps);
+        }
+
+        if (L.layerScale !== 1.0) {
+            encElem1(pass, 'scale', st.x, ne, L.layerScale);
+        }
+    }
+
+    /* Final norm */
+    encRmsnorm(pass, st.x, m.outputNorm, st.x, 1, ne, eps, 0);
+
+    /* Logits: tied embedding — matmul against token_embd */
+    /* Logits matmul fuses softcap (tanh(x/s)*s) into the output write. */
+    encMatmul(pass, m.tokenEmbdT, st.x, st.logits, m.nVocab, ne, m.softcap > 0 ? m.softcap : 0);
+
+    pass.end();
+    enc.copyBufferToBuffer(st.logits, 0, st.logitsStaging, 0, st.logitsBytes);
+    const _tEncodeEnd = performance.now();
+    GPU.device.queue.submit([enc.finish()]);
+
+    /* Readback logits */
+    await st.logitsStaging.mapAsync(GPUMapMode.READ);
+    const _tGpuEnd = performance.now();
+    const mapped = st.logitsStaging.getMappedRange().slice(0);
+    let logits;
+    if (GPU.hasF16) {
+        /* Unpack f16 halves → f32 for sampling. */
+        const u16 = new Uint16Array(mapped);
+        logits = new Float32Array(m.nVocab);
+        for (let i = 0; i < m.nVocab; i++) logits[i] = fp16ToF32(u16[i]);
+    } else {
+        logits = new Float32Array(mapped);
+    }
+    st.logitsStaging.unmap();
+
+    TIMINGS.encode += _tEncodeEnd - _t0;
+    TIMINGS.gpu    += _tGpuEnd - _tEncodeEnd;
+    TIMINGS.count  += 1;
+    return logits;
+}
+
+/* ================================================================
+   SECTION 12: Sampling (CPU) + fast yield
+   ================================================================ */
+
+/* setTimeout(fn, 0) is clamped to a 4 ms minimum in Chrome — that's ~4 ms of
+   wasted wall-clock per token during generation. MessageChannel.postMessage
+   gives a sub-ms macrotask yield which still lets the browser paint and
+   keeps the UI responsive. */
+function _escapeText(s) {
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+const _yieldChan = new MessageChannel();
+let   _yieldResolve = null;
+_yieldChan.port1.onmessage = () => { const r = _yieldResolve; _yieldResolve = null; r && r(); };
+function fastYield() {
+    return new Promise(resolve => {
+        _yieldResolve = resolve;
+        _yieldChan.port2.postMessage(0);
+    });
+}
+
+function sampleArgmax(logits, n) {
+    let best = 0;
+    for (let i = 1; i < n; i++) if (logits[i] > logits[best]) best = i;
+    return best;
+}
+
+function sampleToken(logits, nVocab, temp, topK) {
+    if (temp <= 0) return sampleArgmax(logits, nVocab);
+
+    if (topK > 0 && topK < nVocab) {
+        /* Top-K via one linear scan maintaining a K-sized array of top indices.
+           For K=40 / N=256K that's 256K iterations × up to 40 compares: ~10M simple
+           ops on typed arrays, ~5-10x faster than Array.from + sort-with-callback. */
+        const topIdx  = new Int32Array(topK);
+        const topLog  = new Float32Array(topK);
+        for (let i = 0; i < topK; i++) { topIdx[i] = i; topLog[i] = logits[i]; }
+        /* Find current min in topLog. */
+        let minPos = 0;
+        for (let i = 1; i < topK; i++) if (topLog[i] < topLog[minPos]) minPos = i;
+        for (let i = topK; i < nVocab; i++) {
+            const v = logits[i];
+            if (v > topLog[minPos]) {
+                topIdx[minPos] = i;
+                topLog[minPos] = v;
+                /* Refresh min position. K=40 so linear is fine. */
+                minPos = 0;
+                for (let j = 1; j < topK; j++) if (topLog[j] < topLog[minPos]) minPos = j;
+            }
+        }
+        /* Softmax over the K candidates. */
+        let mx = topLog[0];
+        for (let i = 1; i < topK; i++) if (topLog[i] > mx) mx = topLog[i];
+        let sum = 0;
+        const probs = new Float32Array(topK);
+        for (let i = 0; i < topK; i++) { probs[i] = Math.exp((topLog[i] - mx) / temp); sum += probs[i]; }
+        const r = Math.random() * sum;
+        let cum = 0;
+        for (let i = 0; i < topK; i++) {
+            cum += probs[i];
+            if (cum >= r) return topIdx[i];
+        }
+        return topIdx[topK - 1];
+    }
+
+    /* No top-K: full softmax over the full vocab. */
+    let max = -Infinity;
+    for (let i = 0; i < nVocab; i++) if (logits[i] > max) max = logits[i];
+    const probs = new Float32Array(nVocab);
+    let sum = 0;
+    for (let i = 0; i < nVocab; i++) { probs[i] = Math.exp((logits[i] - max) / temp); sum += probs[i]; }
+    const r = Math.random() * sum;
+    let cum = 0;
+    for (let i = 0; i < nVocab; i++) { cum += probs[i]; if (cum >= r) return i; }
+    return nVocab - 1;
+}
+
+/* ================================================================
+   SECTION 13: UI & generation loop
+   ================================================================ */
+
+const TOK_CHANNEL = 100, TOK_CHANNEL_END = 101, TOK_END_TURN = 106;
+
+let MODEL = null, GGUF = null, STATE = null;
+let generating = false;
+
+function status(msg, cls) {
+    const el = document.getElementById('status');
+    el.innerHTML = cls ? `<span class="${cls}">${msg}</span>` : msg;
+}
+function showBar(pct) {
+    const wrap = document.getElementById('bar-wrap');
+    const fill = document.getElementById('bar-fill');
+    wrap.style.display = pct < 0 ? 'none' : 'block';
+    fill.style.width = Math.max(0, Math.min(100, pct)) + '%';
+}
+
+document.getElementById('model-file').addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    try {
+        status('Initializing WebGPU (compiling shaders)...');
+        GPU = await initWebGPU();
+        const info = GPU.adapter.info || {};
+        const ainfo = `GPU: ${info.vendor || '?'} / ${info.architecture || '?'} / ${info.device || '?'} / ${info.description || ''} ` +
+                      `· maxBuf=${(GPU.limits.maxBufferSize/1e9).toFixed(2)}GB ` +
+                      `· maxBinding=${(GPU.limits.maxStorageBufferBindingSize/1e9).toFixed(2)}GB`;
+        document.getElementById('gpu-info').textContent = ainfo;
+        console.log('[WebGPU]', ainfo, GPU.adapter, GPU.limits);
+
+        status(`Parsing ${file.name} (${(file.size/1e9).toFixed(2)} GB)...`);
+        showBar(0);
+        const headerSize = Math.min(100 * 1024 * 1024, file.size);
+        const headerBuf = await file.slice(0, headerSize).arrayBuffer();
+        GGUF = parseGGUF(headerBuf);
+        status(`GGUF v${GGUF.version}: ${Object.keys(GGUF.tensors).length} tensors. Uploading to GPU...`);
+        showBar(-1);
+
+        MODEL = await loadModel(file, GGUF, (msg) => status(msg));
+
+        const maxCtx = 2048;
+        STATE = initState(MODEL, maxCtx);
+
+        status(`<span class="ok">Model loaded!</span> ${MODEL.nLayer} layers, ${MODEL.nEmbd}d, ${MODEL.nVocab} vocab`, '');
+        document.getElementById('controls').style.display = 'block';
+        document.getElementById('output').style.display = 'block';
+    } catch (err) {
+        status(`<span class="err">Error: ${err.message}</span>`, '');
+        console.error(err);
+    }
+});
+
+/* Reset KV caches by zeroing on GPU. */
+function resetKVCaches() {
+    const enc = GPU.device.createCommandEncoder({ label: 'kv_reset' });
+    for (let il = 0; il < MODEL.nLayerKv; il++) {
+        enc.clearBuffer(STATE.kvK[il]);
+        enc.clearBuffer(STATE.kvV[il]);
+    }
+    GPU.device.queue.submit([enc.finish()]);
+}
+
+document.getElementById('gen-btn').addEventListener('click', async () => {
+    if (!MODEL || generating) return;
+    generating = true;
+    const btn = document.getElementById('gen-btn');
+    btn.disabled = true;
+
+    const prompt = document.getElementById('prompt').value || 'Hello!';
+    const temp = parseFloat(document.getElementById('temp').value) || 0.7;
+    const maxTok = parseInt(document.getElementById('max-tok').value) || 128;
+    const topK = parseInt(document.getElementById('top-k').value) || 40;
+    const think = document.getElementById('think-mode').checked;
+    const raw = document.getElementById('raw-mode').checked;
+
+    const outEl = document.getElementById('output');
+    outEl.textContent = '';
+
+    resetKVCaches();
+    resetTimings();
+
+    const promptTokens = raw
+        ? MODEL.tok.encodeRaw(prompt)
+        : MODEL.tok.encodeChat(prompt, think);
+
+    status(`Generating... (${promptTokens.length} prompt tokens)`);
+    const t0 = performance.now();
+
+    let nextToken = promptTokens[0];
+    let pos = 0;
+    let nGenerated = 0;
+    let inThinking = false;
+
+    /* Accumulate output into JS strings and flush to the DOM every ~8 tokens.
+       Every token previously did outEl.textContent += text and scrollTop =
+       scrollHeight, which forces a sync layout that gets slower as the DIV
+       grows. Batching cuts that cost to near zero. */
+    let pendingText = '';
+    let pendingHTML = '';
+    let htmlBase = '';
+    const flushOutput = () => {
+        if (pendingHTML) {
+            htmlBase += pendingHTML;
+            outEl.innerHTML = htmlBase + _escapeText(pendingText);
+            pendingHTML = '';
+        } else if (pendingText) {
+            outEl.innerHTML = htmlBase + _escapeText(pendingText);
+        }
+        outEl.scrollTop = outEl.scrollHeight;
+    };
+
+    try {
+        for (let step = 0; step < promptTokens.length + maxTok - 1; step++) {
+            const logits = await forward(MODEL, GGUF, STATE, nextToken, pos);
+            const _tPostFwd = performance.now();
+
+            if (step < promptTokens.length - 1) {
+                nextToken = promptTokens[step + 1];
+            } else {
+                nextToken = sampleToken(logits, MODEL.nVocab, temp, topK);
+                if (nextToken === MODEL.tok.eosId || nextToken === TOK_END_TURN || nextToken === 1) {
+                    pendingText += '\n[EOS]';
+                    flushOutput();
+                    break;
+                }
+                if (nextToken === TOK_CHANNEL) {
+                    inThinking = true;
+                    /* Commit buffered plain text into htmlBase before switching to HTML mode. */
+                    if (pendingText) { htmlBase += _escapeText(pendingText); pendingText = ''; }
+                    pendingHTML += '<span class="think">[thinking] ';
+                } else if (nextToken === TOK_CHANNEL_END) {
+                    if (inThinking) {
+                        if (pendingText) { htmlBase += _escapeText(pendingText); pendingText = ''; }
+                        pendingHTML += ' [/thinking]</span>\n';
+                        inThinking = false;
+                    }
+                } else {
+                    pendingText += MODEL.tok.detokenize(nextToken);
+                }
+                nGenerated++;
+            }
+
+            pos++;
+            if (pos >= STATE.maxCtx) {
+                pendingText += '\n[Context limit]';
+                flushOutput();
+                break;
+            }
+
+            const _tPostSample = performance.now();
+
+            /* Throttle both status + DOM output flush to ~every 8 tokens. */
+            if ((step & 7) === 0) {
+                flushOutput();
+                const elapsed = (performance.now() - t0) / 1000;
+                if (step < promptTokens.length - 1) {
+                    status(`Prefill: ${step+1}/${promptTokens.length} tokens (${elapsed.toFixed(1)}s)`);
+                } else {
+                    const tps = nGenerated > 0 ? (nGenerated / elapsed).toFixed(2) : '—';
+                    status(`Generated: ${nGenerated} tokens (${tps} tok/s)`);
+                }
+            }
+            await fastYield();
+            const _tPostYield = performance.now();
+            TIMINGS.sample += _tPostSample - _tPostFwd;
+            TIMINGS.dom    += _tPostYield - _tPostSample;
+        }
+        flushOutput();
+    } catch (err) {
+        flushOutput();
+        outEl.textContent += `\n[Error: ${err.message}]`;
+        console.error(err);
+    }
+
+    const elapsed = (performance.now() - t0) / 1000;
+    const tps = nGenerated > 0 ? (nGenerated / elapsed).toFixed(2) : '0';
+    const perStep = elapsed * 1000 / Math.max(1, TIMINGS.count);
+    const avg = (k) => TIMINGS.count > 0 ? (TIMINGS[k] / TIMINGS.count).toFixed(2) : '-';
+    const encAvg = avg('encode'), gpuAvg = avg('gpu'), smpAvg = avg('sample'), domAvg = avg('dom');
+    outEl.innerHTML += `\n<span class="stats">--- ${nGenerated} tokens in ${elapsed.toFixed(1)}s (${tps} tok/s) | ` +
+                       `per-step ${perStep.toFixed(1)} ms = encode ${encAvg} + gpu ${gpuAvg} + sample ${smpAvg} + dom ${domAvg} ---</span>`;
+    status(`<span class="ok">Done!</span> ${tps} tok/s — enc ${encAvg} · gpu ${gpuAvg} · smp ${smpAvg} · dom ${domAvg}`);
+    console.log('[Timings]', { perStepMs: perStep.toFixed(2), encodeMs: encAvg, gpuMs: gpuAvg,
+                               sampleMs: smpAvg, domMs: domAvg, tokens: nGenerated });
+    btn.disabled = false;
+    generating = false;
+});
+
+</script>
+</body>
+</html>
