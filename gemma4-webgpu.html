@@ -2940,7 +2940,70 @@ function sampleToken(logits, nVocab, temp, topK) {
 const TOK_CHANNEL = 100, TOK_CHANNEL_END = 101, TOK_END_TURN = 106;
 
 let MODEL = null, GGUF = null, STATE = null;
-let generating = false;
+let generating = false, loading = false;
+
+const DEFAULT_MODEL = {
+    name: 'gemma-4-E2B-it-UD-Q4_K_XL.gguf',
+    url: 'https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-UD-Q4_K_XL.gguf?download=true',
+};
+const AUTO_LOAD_DEFAULT_MODEL = new URLSearchParams(location.search).get('autoload') !== '0';
+
+class RemoteGGUFSource {
+    constructor(url, name) {
+        this.url = url;
+        this.name = name;
+        this.size = 0;
+    }
+
+    async init() {
+        this.size = await this.detectSize();
+        return this;
+    }
+
+    async detectSize() {
+        try {
+            const res = await fetch(this.url, { method: 'HEAD', mode: 'cors' });
+            if (res.ok) {
+                const len = parseInt(res.headers.get('content-length') || '0', 10);
+                if (Number.isFinite(len) && len > 0) return len;
+            }
+        } catch (_) {}
+
+        try {
+            const res = await fetch(this.url, {
+                headers: { Range: 'bytes=0-0' },
+                mode: 'cors',
+            });
+            if (res.status === 206) {
+                const cr = res.headers.get('content-range') || '';
+                const m = /\/(\d+)$/.exec(cr);
+                if (m) return parseInt(m[1], 10);
+            }
+        } catch (_) {}
+
+        return 0;
+    }
+
+    slice(start, end) {
+        const source = this;
+        return {
+            async arrayBuffer() {
+                const s = Math.max(0, Math.floor(start || 0));
+                const e = Math.max(s, Math.floor(end || s));
+                if (e <= s) return new ArrayBuffer(0);
+
+                const res = await fetch(source.url, {
+                    headers: { Range: `bytes=${s}-${e - 1}` },
+                    mode: 'cors',
+                });
+                if (res.status !== 206) {
+                    throw new Error('Remote GGUF server did not honor HTTP range requests');
+                }
+                return await res.arrayBuffer();
+            },
+        };
+    }
+}
 
 function status(msg, cls) {
     const el = document.getElementById('status');
@@ -2953,28 +3016,43 @@ function showBar(pct) {
     fill.style.width = Math.max(0, Math.min(100, pct)) + '%';
 }
 
-document.getElementById('model-file').addEventListener('change', async (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
-    try {
-        status('Initializing WebGPU (compiling shaders)...');
-        GPU = await initWebGPU();
-        const info = GPU.adapter.info || {};
-        const ainfo = `GPU: ${info.vendor || '?'} / ${info.architecture || '?'} / ${info.device || '?'} / ${info.description || ''} ` +
-                      `· maxBuf=${(GPU.limits.maxBufferSize/1e9).toFixed(2)}GB ` +
-                      `· maxBinding=${(GPU.limits.maxStorageBufferBindingSize/1e9).toFixed(2)}GB`;
-        document.getElementById('gpu-info').textContent = ainfo;
-        console.log('[WebGPU]', ainfo, GPU.adapter, GPU.limits);
+function formatBytes(n) {
+    return n > 0 ? ` (${(n / 1e9).toFixed(2)} GB)` : '';
+}
 
-        status(`Parsing ${file.name} (${(file.size/1e9).toFixed(2)} GB)...`);
+async function ensureWebGPU() {
+    if (GPU) return GPU;
+    status('Initializing WebGPU (compiling shaders)...');
+    GPU = await initWebGPU();
+    const info = GPU.adapter.info || {};
+    const ainfo = `GPU: ${info.vendor || '?'} / ${info.architecture || '?'} / ${info.device || '?'} / ${info.description || ''} ` +
+                  `· maxBuf=${(GPU.limits.maxBufferSize/1e9).toFixed(2)}GB ` +
+                  `· maxBinding=${(GPU.limits.maxStorageBufferBindingSize/1e9).toFixed(2)}GB`;
+    document.getElementById('gpu-info').textContent = ainfo;
+    console.log('[WebGPU]', ainfo, GPU.adapter, GPU.limits);
+    return GPU;
+}
+
+async function loadSource(source) {
+    if (loading) {
+        status('<span class="warn">A model load is already in progress.</span>', '');
+        return;
+    }
+    loading = true;
+    document.getElementById('model-file').disabled = true;
+    try {
+        await ensureWebGPU();
+
+        status(`Parsing ${source.name}${formatBytes(source.size)}...`);
         showBar(0);
-        const headerSize = Math.min(100 * 1024 * 1024, file.size);
-        const headerBuf = await file.slice(0, headerSize).arrayBuffer();
+        const maxHeaderSize = 100 * 1024 * 1024;
+        const headerSize = source.size > 0 ? Math.min(maxHeaderSize, source.size) : maxHeaderSize;
+        const headerBuf = await source.slice(0, headerSize).arrayBuffer();
         GGUF = parseGGUF(headerBuf);
         status(`GGUF v${GGUF.version}: ${Object.keys(GGUF.tensors).length} tensors. Uploading to GPU...`);
         showBar(-1);
 
-        MODEL = await loadModel(file, GGUF, (msg) => status(msg));
+        MODEL = await loadModel(source, GGUF, (msg) => status(msg));
 
         const maxCtx = 2048;
         STATE = initState(MODEL, maxCtx);
@@ -2985,8 +3063,27 @@ document.getElementById('model-file').addEventListener('change', async (e) => {
     } catch (err) {
         status(`<span class="err">Error: ${err.message}</span>`, '');
         console.error(err);
+    } finally {
+        showBar(-1);
+        document.getElementById('model-file').disabled = false;
+        loading = false;
     }
+}
+
+document.getElementById('model-file').addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    await loadSource(file);
 });
+
+async function autoLoadDefaultModel() {
+    if (!AUTO_LOAD_DEFAULT_MODEL) return;
+    status(`Downloading ${DEFAULT_MODEL.name}...`);
+    const remote = await new RemoteGGUFSource(DEFAULT_MODEL.url, DEFAULT_MODEL.name).init();
+    await loadSource(remote);
+}
+
+autoLoadDefaultModel();
 
 /* Reset KV caches by zeroing on GPU. */
 function resetKVCaches() {
