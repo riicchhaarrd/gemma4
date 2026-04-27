@@ -6,7 +6,7 @@ Single-file Gemma 4 inference experiments for GGUF models.
 
 Try the browser build on GitHub Pages:
 
-https://riicchhaarrd.github.io/gemma4.c/
+https://riicchhaarrd.github.io/gemma4/
 
 The Pages build can load the tested model:
 
