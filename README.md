@@ -1,4 +1,4 @@
-# Gemma4.c
+# gemma4
 
 Single-file Gemma 4 inference experiments for GGUF models.
 
@@ -6,15 +6,17 @@ Single-file Gemma 4 inference experiments for GGUF models.
 
 Try the browser build on GitHub Pages:
 
-https://riicchhaarrd.github.io/gemma4/
+https://riicchhaarrd.github.io/gemma4.c/
 
-The Pages build loads the tested model by default:
+The Pages build can load the tested model:
 
 https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-UD-Q4_K_XL.gguf?download=true
 
-That GGUF is about 3 GB. The first cached load can take several minutes because the browser downloads the whole model before uploading weights to WebGPU. After that, refreshes can reuse the browser cache. You can also uncheck the cache option to stream model ranges, or use a local `.gguf` file.
+The page does not download the model until you click **Load Default Model** or choose a local `.gguf`.
 
-Add `?autoload=0` to the Pages URL if you want the page to open without automatically loading the default model.
+That GGUF is about 3 GB. The first cached load can take several minutes because the browser downloads the whole model before uploading weights to WebGPU. After that, refreshes can reuse the browser cache. You can also choose the streaming mode to fetch model ranges without storing the whole file first.
+
+Add `?autoload=1` to the Pages URL only if you intentionally want the default model load to start automatically.
 
 ## Native C Runner
 
